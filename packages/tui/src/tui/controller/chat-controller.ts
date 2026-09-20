@@ -314,6 +314,18 @@ export class TuiChatController {
     await this.setSessionArchived(session.sessionId, true);
   }
 
+  /** Permanently delete a session and its messages. Irreversible. */
+  async deleteSession(sessionId: string): Promise<void> {
+    this.assertNoActiveTurn('deleting a session');
+    this.invalidateSessionCatalogRefresh();
+    const deleteSession = requireRuntimeMethod(this.runtime, 'deleteSession');
+    await deleteSession(sessionId);
+    this.updateState({
+      sessions: this.state.sessions.filter((session) => session.sessionId !== sessionId),
+      error: undefined,
+    });
+  }
+
   async setSessionArchived(sessionId: string, archived: boolean): Promise<TuiSession> {
     this.assertNoActiveTurn(archived ? 'archiving a session' : 'restoring a session');
     this.invalidateSessionCatalogRefresh();

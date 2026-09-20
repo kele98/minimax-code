@@ -95,25 +95,29 @@ function createHarness(
     getMiniMaxApiKeyStatus: vi.fn(async () => ({ hasApiKey: false })),
     getMiniMaxModelSource: vi.fn(async () => "token_plan" as const),
     deleteUserModelProvider: vi.fn(async () => undefined),
+    deleteSession: vi.fn(async () => undefined),
+    archiveSession: vi.fn(async () => undefined),
   };
   const transcript = new TranscriptStore();
+  const controller = {
+    snapshot: () => ({
+      sessions: [],
+      session: activeSessionId
+        ? {
+            sessionId: activeSessionId,
+            agentName: "mavis",
+            title: "Runtime review",
+            workspaceDir: "/workspace",
+          }
+        : undefined,
+    }),
+    refreshCurrentSessionHistory,
+    refreshStatusMetricsNow: vi.fn(),
+    deleteSession: vi.fn(async () => undefined),
+  } as never;
   const flow = new TuiFeatureFlow({
     runtime: runtime as never,
-    controller: {
-      snapshot: () => ({
-        sessions: [],
-        session: activeSessionId
-          ? {
-              sessionId: activeSessionId,
-              agentName: "mavis",
-              title: "Runtime review",
-              workspaceDir: "/workspace",
-            }
-          : undefined,
-      }),
-      refreshCurrentSessionHistory,
-      refreshStatusMetricsNow: vi.fn(),
-    } as never,
+    controller,
     surface: {
       show: (panel: unknown) => shown.push(panel),
       close: (panel: unknown) => closed.push(panel),
@@ -164,6 +168,7 @@ function createHarness(
   return {
     append,
     closed,
+    controller,
     exportTranscript,
     flow,
     editor,
@@ -248,6 +253,124 @@ describe("TuiFeatureFlow", () => {
     expect(harness.setHint).toHaveBeenLastCalledWith(
       "Stop the running turn before using /sessions.",
     );
+  });
+
+  it("enumerates every archived page and deletes only visible archived sessions", async () => {
+    const harness = createHarness();
+    const page1 = {
+      sessions: [
+        {
+          sessionId: "session-a",
+          title: "Runtime review",
+          workspaceDir: "/workspace",
+          updatedAt: 3,
+        },
+        {
+          sessionId: "session-b",
+          title: "Archived one",
+          workspaceDir: "/workspace",
+          updatedAt: 2,
+          archived: true,
+        },
+        {
+          sessionId: "session-hidden",
+          title: "Hidden archived",
+          workspaceDir: "/workspace",
+          updatedAt: 1,
+          archived: true,
+          visibility: "hidden",
+        },
+      ],
+      hasMore: true,
+      nextCursor: "page-2",
+    };
+    const page2 = {
+      sessions: [
+        {
+          sessionId: "session-c",
+          title: "Archived two",
+          workspaceDir: "/workspace",
+          updatedAt: 0,
+          archived: true,
+        },
+      ],
+      hasMore: false,
+      nextCursor: undefined,
+    };
+    harness.runtime.listSessionPage
+      .mockResolvedValueOnce(page1)
+      .mockResolvedValueOnce(page1)
+      .mockResolvedValueOnce(page2);
+
+    await harness.flow.showSessionManager();
+    const manager = harness.shown[0] as {
+      render(width: number): string[];
+      handleInput(data: string): void;
+    };
+    manager.handleInput("\t");
+    manager.handleInput("\x05");
+    await vi.waitFor(() =>
+      expect(stripAnsi(manager.render(90).join("\n"))).toContain(
+        "Permanently delete 2 archived sessions in this workspace?",
+      ),
+    );
+
+    manager.handleInput("\r");
+    await vi.waitFor(() =>
+      expect(harness.controller.deleteSession).toHaveBeenCalledTimes(2),
+    );
+    expect(harness.controller.deleteSession).toHaveBeenCalledWith("session-b");
+    expect(harness.controller.deleteSession).toHaveBeenCalledWith("session-c");
+    expect(harness.controller.deleteSession).not.toHaveBeenCalledWith("session-hidden");
+    expect(harness.runtime.listSessionPage).toHaveBeenNthCalledWith(3, {
+      allAgents: true,
+      workspaceDir: "/workspace",
+      limit: 50,
+      cursor: "page-2",
+      includeArchived: true,
+      includeHidden: true,
+    });
+    await vi.waitFor(() =>
+      expect(stripAnsi(manager.render(90).join("\n"))).toContain("Deleted 2 sessions."),
+    );
+  });
+
+  it("refuses to delete from the Session manager while a turn is live", async () => {
+    let live = false;
+    const harness = createHarness({ hasLiveRun: () => live });
+    harness.runtime.listSessionPage.mockResolvedValueOnce({
+      sessions: [
+        {
+          sessionId: "session-b",
+          title: "Archived one",
+          workspaceDir: "/workspace",
+          updatedAt: 2,
+          archived: true,
+        },
+      ],
+      hasMore: false,
+      nextCursor: undefined,
+    });
+
+    await harness.flow.showSessionManager();
+    const manager = harness.shown[0] as {
+      render(width: number): string[];
+      handleInput(data: string): void;
+    };
+    manager.handleInput("\t");
+
+    // The turn goes live after the panel opened; deletion must be refused.
+    live = true;
+    manager.handleInput("\x18");
+    manager.handleInput("\r");
+    await vi.waitFor(() =>
+      expect(stripAnsi(manager.render(90).join("\n"))).toContain(
+        "Stop the running turn before deleting a Session.",
+      ),
+    );
+
+    expect(harness.controller.deleteSession).not.toHaveBeenCalled();
+    expect(stripAnsi(manager.render(90).join("\n"))).toContain("Archived one");
   });
 
   it("exports the complete Runtime history in chronological order and reports the file link", async () => {

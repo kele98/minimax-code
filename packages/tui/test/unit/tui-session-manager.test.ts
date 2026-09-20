@@ -57,6 +57,8 @@ function createManager(
       return { ...(session ?? { sessionId }), title };
     }),
     onSetArchived: vi.fn(async () => undefined),
+    onDelete: vi.fn(async () => undefined),
+    onEnumerateArchived: vi.fn(async () => [sessionById('session-archived')]),
     onCancel: vi.fn(),
     requestRender: vi.fn(),
   };
@@ -630,5 +632,293 @@ describe('TuiSessionManager', () => {
 
     expect(requestRender).toHaveBeenCalledTimes(rendersBeforeDispose);
     expect(renderPlain(manager)).not.toContain('Loaded after disposal');
+  });
+
+  it('ignores Ctrl+X delete outside the archived view or while searching', () => {
+    const { callbacks, manager } = createManager();
+
+    manager.handleInput('\x18');
+    expect(callbacks.onDelete).not.toHaveBeenCalled();
+    expect(renderPlain(manager)).not.toContain('Delete session?');
+
+    manager.handleInput('\t');
+    manager.handleInput('archived');
+    manager.handleInput('\x18');
+    expect(callbacks.onDelete).not.toHaveBeenCalled();
+    expect(renderPlain(manager)).not.toContain('Delete session?');
+  });
+
+  it('permanently deletes the selected archived session after one confirmation', async () => {
+    const { callbacks, manager } = createManager();
+    manager.handleInput('\t');
+
+    manager.handleInput('\x18');
+    expect(renderPlain(manager)).toContain('Delete session?');
+    expect(renderPlain(manager)).toContain('Archived investigation');
+    expect(renderPlain(manager)).toContain('This cannot be undone. Branches are kept.');
+    expect(renderPlain(manager)).not.toContain('Archive session?');
+
+    manager.handleInput('\r');
+    await vi.waitFor(() => expect(callbacks.onDelete).toHaveBeenCalledWith('session-archived'));
+    await flushActions();
+
+    expect(renderPlain(manager)).not.toContain('Archived investigation');
+    expect(renderPlain(manager)).toContain('Session deleted.');
+  });
+
+  it('cancels the delete confirmation with Esc and keeps the session', async () => {
+    const { callbacks, manager } = createManager();
+    manager.handleInput('\t');
+
+    manager.handleInput('\x18');
+    manager.handleInput('\x1b');
+    await flushActions();
+
+    expect(callbacks.onDelete).not.toHaveBeenCalled();
+    expect(renderPlain(manager)).not.toContain('Delete session?');
+    expect(renderPlain(manager)).toContain('Archived investigation');
+  });
+
+  it('keeps the archived session and surfaces the failure when deletion fails', async () => {
+    const onDelete = vi.fn(async () => {
+      throw new Error('This session is owned by a scheduled task.');
+    });
+    const { manager } = createManager({ onDelete });
+    manager.handleInput('\t');
+
+    manager.handleInput('\x18');
+    manager.handleInput('\r');
+    await vi.waitFor(() => expect(onDelete).toHaveBeenCalledOnce());
+    await flushActions();
+
+    expect(renderPlain(manager)).not.toContain('Delete session?');
+    expect(renderPlain(manager)).toContain('Session changes were not saved');
+    expect(renderPlain(manager)).toContain('Archived investigation');
+  });
+
+  it('waits out an in-flight page load before deleting so the row cannot be re-added', async () => {
+    let resolvePage:
+      | ((page: { sessions: readonly TuiSession[]; hasMore: boolean }) => void)
+      | undefined;
+    const page = new Promise<{ sessions: readonly TuiSession[]; hasMore: boolean }>((resolve) => {
+      resolvePage = resolve;
+    });
+    const { callbacks, manager } = createManager({
+      sessions: [sessionById('session-archived')],
+      hasMore: true,
+      onLoadMore: vi.fn(() => page),
+    });
+    manager.handleInput('\t');
+    manager.handleInput('\x0c');
+    manager.handleInput('\x18');
+    manager.handleInput('\r');
+
+    // The delete action waits out the in-flight page load before deleting, so
+    // the late page merge cannot resurrect the deleted row.
+    resolvePage?.({ sessions: [sessionById('session-archived')], hasMore: false });
+    await page;
+    await vi.waitFor(() => expect(callbacks.onDelete).toHaveBeenCalledOnce());
+    await flushActions();
+
+    expect(renderPlain(manager)).not.toContain('Archived investigation');
+    expect(renderPlain(manager)).toContain('Session deleted.');
+  });
+
+  it('empties every archived session after the authoritative count confirmation', async () => {
+    const extraArchived: TuiSession = {
+      sessionId: 'session-archived-2',
+      title: 'Older investigation',
+      workspaceDir: '/workspace',
+      updatedAt: NOW - 48 * 60 * 60 * 1000,
+      archived: true,
+    };
+    const onEnumerateArchived = vi.fn(async () => [
+      sessionById('session-archived'),
+      extraArchived,
+    ]);
+    const { callbacks, manager } = createManager({
+      sessions: [sessionById('session-current'), sessionById('session-archived'), extraArchived],
+      onEnumerateArchived,
+    });
+    manager.handleInput('\t');
+
+    manager.handleInput('\x05');
+    expect(renderPlain(manager)).toContain('Delete all archived sessions?');
+    await vi.waitFor(() =>
+      expect(renderPlain(manager)).toContain(
+        'Permanently delete 2 archived sessions in this workspace?',
+      ),
+    );
+    expect(renderPlain(manager)).toContain(
+      'Sessions owned by scheduled tasks are kept.',
+    );
+
+    manager.handleInput('\r');
+    await vi.waitFor(() => expect(callbacks.onDelete).toHaveBeenCalledTimes(2));
+    await flushActions();
+
+    expect(callbacks.onDelete).toHaveBeenNthCalledWith(1, 'session-archived');
+    expect(callbacks.onDelete).toHaveBeenNthCalledWith(2, 'session-archived-2');
+    expect(renderPlain(manager)).not.toContain('Archived investigation');
+    expect(renderPlain(manager)).not.toContain('Older investigation');
+    expect(renderPlain(manager)).toContain('Deleted 2 sessions.');
+  });
+
+  it('ignores Enter while the bulk count is still loading', () => {
+    let resolveEnumeration: ((value: readonly TuiSession[]) => void) | undefined;
+    const onEnumerateArchived = vi.fn(
+      () =>
+        new Promise<readonly TuiSession[]>((resolve) => {
+          resolveEnumeration = resolve;
+        }),
+    );
+    const { callbacks, manager } = createManager({ onEnumerateArchived });
+    manager.handleInput('\t');
+
+    manager.handleInput('\x05');
+    expect(renderPlain(manager)).toContain('Counting archived sessions…');
+    manager.handleInput('\r');
+    expect(callbacks.onDelete).not.toHaveBeenCalled();
+    expect(renderPlain(manager)).toContain('Delete all archived sessions?');
+
+    resolveEnumeration?.([]);
+  });
+
+  it('discards a stale enumeration result after leaving and re-entering the confirm', async () => {
+    let resolveFirst: ((value: readonly TuiSession[]) => void) | undefined;
+    let resolveLater: ((value: readonly TuiSession[]) => void) | undefined;
+    let calls = 0;
+    const onEnumerateArchived = vi.fn(() => {
+      calls += 1;
+      return new Promise<readonly TuiSession[]>((resolve) => {
+        if (calls === 1) resolveFirst = resolve;
+        else resolveLater = resolve;
+      });
+    });
+    const { callbacks, manager } = createManager({ onEnumerateArchived });
+    manager.handleInput('\t');
+
+    manager.handleInput('\x05');
+    manager.handleInput('\x1b');
+    manager.handleInput('\x05');
+    await vi.waitFor(() => expect(onEnumerateArchived).toHaveBeenCalledTimes(2));
+
+    // The first (stale) enumeration resolves late; it must be discarded — the
+    // panel still waits for the fresh result.
+    resolveFirst?.([sessionById('session-archived')]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(renderPlain(manager)).toContain('Counting archived sessions…');
+
+    const fresh: TuiSession = {
+      sessionId: 'session-archived-fresh',
+      title: 'Fresh investigation',
+      workspaceDir: '/workspace',
+      updatedAt: NOW - 5_000,
+      archived: true,
+    };
+    resolveLater?.([fresh]);
+    await vi.waitFor(() =>
+      expect(renderPlain(manager)).toContain(
+        'Permanently delete 1 archived session in this workspace?',
+      ),
+    );
+
+    manager.handleInput('\r');
+    await vi.waitFor(() => expect(callbacks.onDelete).toHaveBeenCalledTimes(1));
+    expect(callbacks.onDelete).toHaveBeenCalledWith('session-archived-fresh');
+    expect(callbacks.onDelete).not.toHaveBeenCalledWith('session-archived');
+  });
+
+  it('skips deletion when the session was restored while the confirm panel was open', async () => {
+    const { callbacks, manager } = createManager();
+    manager.handleInput('\t');
+
+    manager.handleInput('\x18');
+    // Simulate a cross-window restore merged into the local list while the
+    // confirm panel was open.
+    manager.setSessions(
+      sessions.map((session) =>
+        session.sessionId === 'session-archived' ? { ...session, archived: false } : session,
+      ),
+    );
+    manager.handleInput('\r');
+    await flushActions();
+
+    expect(callbacks.onDelete).not.toHaveBeenCalled();
+    expect(renderPlain(manager)).toContain('Session is no longer archived.');
+  });
+
+  it('skips sessions the runtime refuses to delete and reports the summary', async () => {
+    const onDelete = vi.fn(async (sessionId: string) => {
+      if (sessionId === 'session-archived-2') {
+        throw new Error('This session is owned by a scheduled task.');
+      }
+    });
+    const extraArchived: TuiSession = {
+      sessionId: 'session-archived-2',
+      title: 'Cron-owned investigation',
+      workspaceDir: '/workspace',
+      updatedAt: NOW - 48 * 60 * 60 * 1000,
+      archived: true,
+    };
+    const onEnumerateArchived = vi.fn(async () => [
+      sessionById('session-archived'),
+      extraArchived,
+    ]);
+    const { manager } = createManager({
+      sessions: [sessionById('session-archived'), extraArchived],
+      onDelete,
+      onEnumerateArchived,
+    });
+    manager.handleInput('\t');
+
+    manager.handleInput('\x05');
+    await vi.waitFor(() =>
+      expect(renderPlain(manager)).toContain('Permanently delete 2 archived sessions'),
+    );
+    manager.handleInput('\r');
+    await vi.waitFor(() => expect(onDelete).toHaveBeenCalledTimes(2));
+    await flushActions();
+
+    expect(renderPlain(manager)).toContain('Deleted 1 session. Skipped 1.');
+    expect(renderPlain(manager)).not.toContain('Archived investigation');
+    expect(renderPlain(manager)).toContain('Cron-owned investigation');
+  });
+
+  it('reports zero archived sessions without asking for confirmation', async () => {
+    const onEnumerateArchived = vi.fn(async () => []);
+    const { callbacks, manager } = createManager({ onEnumerateArchived });
+    manager.handleInput('\t');
+
+    manager.handleInput('\x05');
+    await vi.waitFor(() => expect(renderPlain(manager)).toContain('No archived sessions.'));
+    expect(callbacks.onDelete).not.toHaveBeenCalled();
+    expect(renderPlain(manager)).not.toContain('Permanently delete 0');
+  });
+
+  it('stays in the confirm panel when the archived enumeration fails', async () => {
+    const onEnumerateArchived = vi.fn(async () => {
+      throw new Error('Runtime unavailable');
+    });
+    const { callbacks, manager } = createManager({ onEnumerateArchived });
+    manager.handleInput('\t');
+
+    manager.handleInput('\x05');
+    await vi.waitFor(() =>
+      expect(renderPlain(manager)).toContain("Couldn't count archived sessions:"),
+    );
+
+    manager.handleInput('\r');
+    expect(callbacks.onDelete).not.toHaveBeenCalled();
+    expect(renderPlain(manager)).toContain('Delete all archived sessions?');
+  });
+
+  it('shows the delete and empty shortcuts in the archived footer only', () => {
+    const { manager } = createManager();
+
+    expect(renderPlain(manager)).not.toContain('Ctrl+X delete');
+    manager.handleInput('\t');
+    expect(renderPlain(manager)).toContain('Ctrl+X delete · Ctrl+E empty');
   });
 });

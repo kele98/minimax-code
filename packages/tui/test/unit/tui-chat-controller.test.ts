@@ -2704,6 +2704,166 @@ describe('TuiChatController', () => {
     );
   });
 
+  it('permanently deletes a session through the runtime and drops it from the catalog', async () => {
+    const runtime = {
+      createSession: vi.fn(async (input: { workspaceDir: string }) => ({
+        sessionId: 'session-1',
+        workspaceDir: input.workspaceDir,
+      })),
+      listSessions: vi.fn(async () => [
+        {
+          sessionId: 'session-1',
+          title: 'First',
+          workspaceDir: '/workspace',
+          updatedAt: 200,
+        },
+        {
+          sessionId: 'session-2',
+          title: 'Second',
+          workspaceDir: '/other',
+          updatedAt: 100,
+        },
+      ]),
+      getSession: vi.fn(async (sessionId: string) => ({
+        sessionId,
+        title: 'First',
+        workspaceDir: '/workspace',
+      })),
+      getMessages: vi.fn(async () => []),
+      deleteSession: vi.fn(async () => undefined),
+      sendMessage: vi.fn(),
+      abortSession: vi.fn(async () => true),
+      getAccountStatus: vi.fn(async () => ({
+        status: 'ready' as const,
+        warnings: [],
+      })),
+    };
+    const controller = new TuiChatController({
+      runtime,
+      transcript: new TranscriptStore(),
+      workspaceDir: '/workspace',
+    });
+
+    await controller.initialize();
+    expect(controller.snapshot().sessions.map((session) => session.sessionId)).toContain(
+      'session-2',
+    );
+
+    await controller.deleteSession('session-2');
+
+    expect(runtime.deleteSession).toHaveBeenCalledWith('session-2');
+    expect(controller.snapshot().sessions.map((session) => session.sessionId)).not.toContain(
+      'session-2',
+    );
+  });
+
+  it('refuses to delete a session while a turn is active', async () => {
+    const runtime = {
+      createSession: vi.fn(async (input: { workspaceDir: string }) => ({
+        sessionId: 'session-1',
+        workspaceDir: input.workspaceDir,
+      })),
+      listSessions: vi.fn(async () => [
+        {
+          sessionId: 'session-1',
+          title: 'First',
+          workspaceDir: '/workspace',
+          updatedAt: 200,
+        },
+        {
+          sessionId: 'session-2',
+          title: 'Second',
+          workspaceDir: '/workspace',
+          updatedAt: 100,
+        },
+      ]),
+      getSession: vi.fn(async (sessionId: string) => ({
+        sessionId,
+        title: 'First',
+        workspaceDir: '/workspace',
+      })),
+      getMessages: vi.fn(async () => []),
+      sendMessage: vi.fn(() => new Promise<void>(() => undefined)),
+      abortSession: vi.fn(async () => true),
+      deleteSession: vi.fn(async () => undefined),
+      getAccountStatus: vi.fn(async () => ({
+        status: 'ready' as const,
+        warnings: [],
+      })),
+    };
+    const controller = new TuiChatController({
+      runtime,
+      transcript: new TranscriptStore(),
+      workspaceDir: '/workspace',
+    });
+
+    await controller.initialize();
+    const submission = controller.submit('Say hello');
+    submission.catch(() => undefined);
+    await vi.waitFor(() => expect(controller.snapshot().activeTurnId).toBeDefined());
+
+    await expect(controller.deleteSession('session-2')).rejects.toThrow(
+      'Stop the running turn before deleting a session.',
+    );
+
+    expect(runtime.deleteSession).not.toHaveBeenCalled();
+    expect(controller.snapshot().sessions.map((session) => session.sessionId)).toContain(
+      'session-2',
+    );
+  });
+
+  it('propagates runtime deletion failures and keeps the session catalog unchanged', async () => {
+    const runtime = {
+      createSession: vi.fn(async (input: { workspaceDir: string }) => ({
+        sessionId: 'session-1',
+        workspaceDir: input.workspaceDir,
+      })),
+      listSessions: vi.fn(async () => [
+        {
+          sessionId: 'session-1',
+          title: 'First',
+          workspaceDir: '/workspace',
+          updatedAt: 200,
+        },
+        {
+          sessionId: 'session-2',
+          title: 'Cron owned',
+          workspaceDir: '/workspace',
+          updatedAt: 100,
+        },
+      ]),
+      getSession: vi.fn(async (sessionId: string) => ({
+        sessionId,
+        title: 'First',
+        workspaceDir: '/workspace',
+      })),
+      getMessages: vi.fn(async () => []),
+      deleteSession: vi.fn(async () => {
+        throw new Error('This session is owned by a scheduled task.');
+      }),
+      sendMessage: vi.fn(),
+      abortSession: vi.fn(async () => true),
+      getAccountStatus: vi.fn(async () => ({
+        status: 'ready' as const,
+        warnings: [],
+      })),
+    };
+    const controller = new TuiChatController({
+      runtime,
+      transcript: new TranscriptStore(),
+      workspaceDir: '/workspace',
+    });
+
+    await controller.initialize();
+    await expect(controller.deleteSession('session-2')).rejects.toThrow(
+      'This session is owned by a scheduled task.',
+    );
+
+    expect(controller.snapshot().sessions.map((session) => session.sessionId)).toContain(
+      'session-2',
+    );
+  });
+
   it('clears input-adjacent tasks when starting a new session', () => {
     const onTodoChange = vi.fn();
     const controller = new ProductionTuiChatController({

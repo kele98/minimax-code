@@ -88,7 +88,7 @@ If `ghostty` is not on `PATH`, use the executable inside your installed app bund
 
 ### Keep Option for text and customize MCode instead
 
-While idle, open `/hotkeys`, select `composer.cycle-permission`, press `Enter`, press `Ctrl+X`, then press `Enter` to save. `Ctrl+X` is unused by the current default MCode bindings; check any custom terminal or multiplexer bindings too. Do not choose `Ctrl+M`: terminals commonly encode it identically to `Enter`.
+While idle, open `/hotkeys`, select `composer.cycle-permission`, press `Enter`, press `Ctrl+X`, then press `Enter` to save. `Ctrl+X` has no default composer binding; the Session manager's archived view uses it to delete the selected session, so both bindings can coexist. Check any custom terminal or multiplexer bindings too. Do not choose `Ctrl+M`: terminals commonly encode it identically to `Enter`.
 
 Alternatively, merge this entry into `<data-dir>/tui/keybindings.json`, preserving any existing entries:
 

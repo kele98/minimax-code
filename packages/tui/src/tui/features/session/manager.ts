@@ -25,7 +25,7 @@ import { formatTuiActionFailure } from '../../../user-facing-failure.js';
 
 type SessionManagerView = 'active' | 'archived';
 type SessionManagerScope = 'workspace' | 'all';
-type SessionManagerMode = 'list' | 'rename' | 'confirm-archive';
+type SessionManagerMode = 'list' | 'rename' | 'confirm-archive' | 'confirm-delete' | 'confirm-empty-archived';
 type SessionRecencySection = 'today' | 'yesterday' | 'previous-7-days' | 'older';
 const SESSION_LIST_VISIBLE_LIMIT = 10;
 const SESSION_SEARCH_DEBOUNCE_MS = 200;
@@ -49,6 +49,14 @@ export interface TuiSessionManagerOptions {
   onNew(): Promise<void> | void;
   onRename(sessionId: string, title: string): Promise<TuiSession>;
   onSetArchived(sessionId: string, archived: boolean): Promise<void> | void;
+  /** Permanently delete a session. Only reachable from the archived view. */
+  onDelete(sessionId: string): Promise<void>;
+  /**
+   * Authoritative enumeration of every archived session in the manager's
+   * current scope, including pages the visible window has not loaded. Used
+   * for the bulk-delete confirmation count and loop.
+   */
+  onEnumerateArchived(): Promise<readonly TuiSession[]>;
   onCancel(): void;
   requestRender(): void;
   now?: () => number;
@@ -68,6 +76,11 @@ export class TuiSessionManager implements Component, Focusable {
   private selectedIndex = 0;
   private selectedSessionId?: string;
   private actionTargetId?: string;
+  /** Snapshot for the bulk-delete confirm; authoritative via onEnumerateArchived. */
+  private emptyTargets?: TuiSession[];
+  private emptyCountPending = false;
+  private emptyCountError?: string;
+  private emptyEnumerationToken = 0;
   private busy = false;
   private hasMore: boolean;
   private loadingMore = false;
@@ -138,6 +151,16 @@ export class TuiSessionManager implements Component, Focusable {
       else if (getKeybindings().matches(data, 'tui.select.cancel')) this.exitActionMode();
       return;
     }
+    if (this.mode === 'confirm-delete') {
+      if (matchesKey(data, Key.enter)) this.confirmDelete();
+      else if (getKeybindings().matches(data, 'tui.select.cancel')) this.exitActionMode();
+      return;
+    }
+    if (this.mode === 'confirm-empty-archived') {
+      if (matchesKey(data, Key.enter)) this.confirmEmptyArchived();
+      else if (getKeybindings().matches(data, 'tui.select.cancel')) this.exitActionMode();
+      return;
+    }
 
     if (matchesKey(data, Key.up)) {
       this.moveSelection(-1);
@@ -179,6 +202,14 @@ export class TuiSessionManager implements Component, Focusable {
     }
     if (!searchActive && matchesKey(data, Key.ctrl('d'))) {
       this.toggleSelectedArchived();
+      return;
+    }
+    if (!searchActive && this.view === 'archived' && matchesKey(data, Key.ctrl('x'))) {
+      this.enterDeleteConfirm();
+      return;
+    }
+    if (!searchActive && this.view === 'archived' && matchesKey(data, Key.ctrl('e'))) {
+      this.enterEmptyArchivedConfirm();
       return;
     }
     if (matchesKey(data, Key.enter)) {
@@ -239,6 +270,18 @@ export class TuiSessionManager implements Component, Focusable {
         safeWidth,
       );
     }
+    if (this.mode === 'confirm-delete') {
+      return this.fitLines(
+        this.fitToRows(this.renderDeleteConfirmation(safeWidth, maxRows), maxRows),
+        safeWidth,
+      );
+    }
+    if (this.mode === 'confirm-empty-archived') {
+      return this.fitLines(
+        this.fitToRows(this.renderEmptyArchivedConfirmation(safeWidth, maxRows), maxRows),
+        safeWidth,
+      );
+    }
     return this.fitLines(this.fitToRows(this.renderList(safeWidth, maxRows), maxRows), safeWidth);
   }
 
@@ -280,7 +323,9 @@ export class TuiSessionManager implements Component, Focusable {
       ? undefined
       : `Ctrl+A ${this.scope === 'workspace' ? 'all' : 'current'} · Ctrl+N new · Ctrl+R rename · Ctrl+D ${
           this.view === 'active' ? 'archive' : 'restore'
-        }${this.hasMore ? ' · More sessions available · Ctrl+L more' : ''} · Esc close`;
+        }${this.view === 'archived' ? ' · Ctrl+X delete · Ctrl+E empty' : ''}${
+          this.hasMore ? ' · More sessions available · Ctrl+L more' : ''
+        } · Esc close`;
     const footerRows = renderPanelFooter(
       [primaryFooter, ...(secondaryFooter ? [secondaryFooter] : [])],
       Math.max(1, width - 4),
@@ -607,6 +652,56 @@ export class TuiSessionManager implements Component, Focusable {
     );
   }
 
+  private renderDeleteConfirmation(width: number, height?: number): string[] {
+    const target = this.findActionTarget();
+    return renderPanelFrame(
+      {
+        title: 'Delete session?',
+        body: [
+          sanitizeTerminalText(target?.title?.trim() || target?.sessionId || 'Unknown session'),
+          chalk.hex(colors.muted)(
+            'Session and messages will be permanently deleted. This cannot be undone. Branches are kept.',
+          ),
+        ],
+        footer: 'Enter delete · Esc cancel',
+      },
+      width,
+      height,
+      'warning',
+    );
+  }
+
+  private renderEmptyArchivedConfirmation(width: number, height?: number): string[] {
+    const scopeLabel =
+      this.scope === 'workspace' ? 'in this workspace' : 'across all workspaces';
+    const body: string[] = [];
+    if (this.emptyCountPending) {
+      body.push('Counting archived sessions…');
+    } else if (this.emptyCountError) {
+      body.push(chalk.hex(colors.error)(`! ${this.emptyCountError}`));
+    } else {
+      const count = this.emptyTargets?.length ?? 0;
+      body.push(
+        `Permanently delete ${count} archived session${count === 1 ? '' : 's'} ${scopeLabel}?`,
+      );
+      body.push(
+        chalk.hex(colors.muted)(
+          'This cannot be undone. Branches are kept. Sessions owned by scheduled tasks are kept.',
+        ),
+      );
+    }
+    return renderPanelFrame(
+      {
+        title: 'Delete all archived sessions?',
+        body,
+        footer: 'Enter delete · Esc cancel',
+      },
+      width,
+      height,
+      'warning',
+    );
+  }
+
   private visibleSessions(): TuiSession[] {
     const queryTokens = this.searchInput
       .getValue()
@@ -892,9 +987,156 @@ export class TuiSessionManager implements Component, Focusable {
     });
   }
 
-  private async runAction(action: () => Promise<void>): Promise<void> {
+  /** Enter the permanent-delete confirmation for the selected archived session. */
+  private enterDeleteConfirm(): void {
+    const session = this.selectedSession();
+    if (!session) return;
+    this.mode = 'confirm-delete';
+    this.actionTargetId = session.sessionId;
+    this.status = undefined;
+    this.syncInputFocus();
+    this.requestRender();
+  }
+
+  /**
+   * Enter the empty-all-archived confirmation. The count comes from the
+   * authoritative enumeration (async); stale results are discarded.
+   */
+  private enterEmptyArchivedConfirm(): void {
+    this.mode = 'confirm-empty-archived';
+    this.emptyTargets = undefined;
+    this.emptyCountError = undefined;
+    this.emptyCountPending = true;
+    this.status = undefined;
+    this.syncInputFocus();
+    this.requestRender();
+    const token = ++this.emptyEnumerationToken;
+    this.options
+      .onEnumerateArchived()
+      .then((sessions) => {
+        if (this.isStaleEnumeration(token)) return;
+        this.emptyCountPending = false;
+        if (sessions.length === 0) {
+          // Nothing to delete: leave the confirm mode without asking.
+          this.exitActionMode();
+          this.setStatus('No archived sessions.', 'info');
+          return;
+        }
+        this.emptyTargets = [...sessions];
+        this.requestRender();
+      })
+      .catch((error: unknown) => {
+        if (this.isStaleEnumeration(token)) return;
+        this.emptyCountPending = false;
+        this.emptyCountError = formatTuiActionFailure(error, {
+          summary: "Couldn't count archived sessions.",
+          nextStep: 'Press Esc, then retry with Ctrl+E.',
+          preservation: 'Nothing was deleted.',
+        });
+        this.requestRender();
+      });
+  }
+
+  /** True when an enumeration result was superseded by Esc or re-entry. */
+  private isStaleEnumeration(token: number): boolean {
+    return (
+      this.disposed ||
+      token !== this.emptyEnumerationToken ||
+      this.mode !== 'confirm-empty-archived'
+    );
+  }
+
+  private confirmDelete(): void {
+    const target = this.findActionTarget();
+    if (!target) {
+      this.exitActionMode();
+      return;
+    }
+    void this.runAction(async () => {
+      try {
+        // An in-flight page load can re-add the deleted row on merge; wait it out.
+        if (this.pageLoad) await this.pageLoad;
+        // Another host may have restored the session while this panel was open,
+        // and the awaited page merge may have brought the restored copy in.
+        const current = this.sessions.find((session) => session.sessionId === target.sessionId);
+        if (current && current.archived !== true) {
+          this.setStatus('Session is no longer archived.', 'info');
+          return;
+        }
+        await this.options.onDelete(target.sessionId);
+        if (!this.disposed) {
+          this.sessions = this.sessions.filter(
+            (session) => session.sessionId !== target.sessionId,
+          );
+          if (this.activeSessionId === target.sessionId) this.activeSessionId = undefined;
+          this.clampSelection();
+          this.setStatus('Session deleted.', 'info');
+        }
+      } finally {
+        // Exit on failure too: confirm panels have no status row, so the
+        // formatted error is only visible back in list mode.
+        this.exitActionMode(false);
+      }
+    });
+  }
+
+  private confirmEmptyArchived(): void {
+    // Enter is ignored while the count is pending or after an enumeration failure.
+    if (this.emptyCountPending || this.emptyCountError) return;
+    const targets = this.emptyTargets ?? [];
+    if (targets.length === 0) {
+      this.exitActionMode();
+      this.setStatus('No archived sessions.', 'info');
+      return;
+    }
+    // Exit first so the list-mode status line can carry progress and summary.
+    this.exitActionMode();
+    void this.runAction(async () => {
+      // An in-flight page load can re-add deleted rows on merge; wait it out.
+      if (this.pageLoad) await this.pageLoad;
+      let deleted = 0;
+      let skipped = 0;
+      for (let index = 0; index < targets.length; index += 1) {
+        const target = targets[index];
+        try {
+          await this.options.onDelete(target.sessionId);
+          deleted += 1;
+          if (!this.disposed) {
+            this.sessions = this.sessions.filter(
+              (session) => session.sessionId !== target.sessionId,
+            );
+            if (this.activeSessionId === target.sessionId) this.activeSessionId = undefined;
+            this.clampSelection();
+            this.status = {
+              tone: 'info',
+              text: `Deleting ${index + 1}/${targets.length}…`,
+            };
+            this.requestRender();
+          }
+        } catch {
+          // e.g. cron-owned sessions throw 409; keep the row and continue.
+          skipped += 1;
+        }
+      }
+      // The loop continues after dispose: the user confirmed the batch, and
+      // stopping midway would leave a half-emptied archive with no summary.
+      if (this.disposed) return;
+      this.setStatus(
+        `Deleted ${deleted} session${deleted === 1 ? '' : 's'}.${
+          skipped > 0 ? ` Skipped ${skipped}.` : ''
+        }`,
+        'info',
+      );
+      this.requestRender();
+    }, 'Deleting…');
+  }
+
+  private async runAction(
+    action: () => Promise<void>,
+    progressLabel = 'Working…',
+  ): Promise<void> {
     this.busy = true;
-    this.status = { tone: 'info', text: 'Working…' };
+    this.status = { tone: 'info', text: progressLabel };
     this.requestRender();
     try {
       await action();
@@ -920,6 +1162,9 @@ export class TuiSessionManager implements Component, Focusable {
     this.mode = 'list';
     this.actionTargetId = undefined;
     this.actionInput.setValue('');
+    this.emptyTargets = undefined;
+    this.emptyCountPending = false;
+    this.emptyCountError = undefined;
     this.syncInputFocus();
     if (requestRender) this.requestRender();
   }

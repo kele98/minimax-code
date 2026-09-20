@@ -73,6 +73,8 @@ import type { McodeCodexOAuthStatus, McodeProviderTemplate } from '../../../prov
 import { McodePluginApplication } from '../../../plugin/application.js';
 import type { McodePluginRuntimeAccess, McodePluginView } from '../../../plugin/contract.js';
 import { formatTuiActionFailure } from '../../../user-facing-failure.js';
+import { isTuiInternalSubagentSession } from '../../../runtime/delegation.js';
+import { isSurfaceableHiddenBranch } from '../../../runtime/session-visibility.js';
 import type { TuiTranscriptExporter } from '../../../host/transcript-export.js';
 import { TuiSessionForkFlow } from '../session-fork-flow.js';
 import { hyperlink } from '../../engine/public.js';
@@ -569,6 +571,37 @@ export class TuiFeatureFlow {
         await this.options.controller.setSessionArchived(sessionId, archived);
         if (archived && wasCurrent) await this.options.onArchivedCurrentSession(sessionId);
         this.options.onChanged();
+      },
+      onDelete: async (sessionId) => {
+        if (this.rejectLiveSessionNavigation('/sessions')) {
+          throw new Error('Stop the running turn before deleting a Session.');
+        }
+        await this.options.controller.deleteSession(sessionId);
+        this.options.onChanged();
+      },
+      onEnumerateArchived: async () => {
+        const scope = loadedScope;
+        // Local cursor only: the shared nextCursor feeds onLoadMore/onScopeChange.
+        let cursor: string | undefined;
+        const seenCursors = new Set<string>();
+        const collected: TuiSession[] = [];
+        for (;;) {
+          const page = await loadSessionPage(scope, cursor);
+          collected.push(...page.sessions);
+          cursor = page.nextCursor;
+          if (!page.hasMore || !cursor) break;
+          // A misbehaving runtime must not turn this into an endless loop.
+          if (seenCursors.has(cursor)) {
+            throw new Error('Runtime returned a duplicate session cursor.');
+          }
+          seenCursors.add(cursor);
+        }
+        return collected.filter(
+          (session) =>
+            session.archived === true &&
+            !isTuiInternalSubagentSession(session) &&
+            (session.visibility !== 'hidden' || isSurfaceableHiddenBranch(session)),
+        );
       },
       onCancel: () => this.options.surface.close(manager),
       requestRender: this.options.onChanged,
