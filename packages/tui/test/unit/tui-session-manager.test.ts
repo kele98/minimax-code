@@ -655,7 +655,10 @@ describe('TuiSessionManager', () => {
     manager.handleInput('\x18');
     expect(renderPlain(manager)).toContain('Delete session?');
     expect(renderPlain(manager)).toContain('Archived investigation');
-    expect(renderPlain(manager)).toContain('This cannot be undone. Branches are kept.');
+    expect(renderPlain(manager)).toContain('This cannot be undone.');
+    expect(renderPlain(manager)).toContain(
+      'Branches are kept and re-attached to their parent chain.',
+    );
     expect(renderPlain(manager)).not.toContain('Archive session?');
 
     manager.handleInput('\r');
@@ -852,7 +855,10 @@ describe('TuiSessionManager', () => {
   it('skips sessions the runtime refuses to delete and reports the summary', async () => {
     const onDelete = vi.fn(async (sessionId: string) => {
       if (sessionId === 'session-archived-2') {
-        throw new Error('This session is owned by a scheduled task.');
+        // The runtime refusal carries its stable AppError key.
+        throw Object.assign(new Error('This session is owned by a scheduled task.'), {
+          key: 'CRON_OWNED_SESSION',
+        });
       }
     });
     const extraArchived: TuiSession = {
@@ -881,9 +887,93 @@ describe('TuiSessionManager', () => {
     await vi.waitFor(() => expect(onDelete).toHaveBeenCalledTimes(2));
     await flushActions();
 
-    expect(renderPlain(manager)).toContain('Deleted 1 session. Skipped 1.');
+    expect(renderPlain(manager)).toContain('Deleted 1 session. Kept 1 (scheduled task).');
     expect(renderPlain(manager)).not.toContain('Archived investigation');
     expect(renderPlain(manager)).toContain('Cron-owned investigation');
+  });
+
+  it('distinguishes every bulk delete bucket and keeps refused rows', async () => {
+    const onDelete = vi.fn(async (sessionId: string) => {
+      if (sessionId === 'session-restored') {
+        // Runtime refusal shape: AppError carries the stable key.
+        throw Object.assign(new Error('no longer archived'), {
+          key: 'SESSION_NOT_ARCHIVED',
+        });
+      }
+      if (sessionId === 'session-cron') {
+        throw Object.assign(new Error('cron-owned'), { key: 'CRON_OWNED_SESSION' });
+      }
+      if (sessionId === 'session-broken') {
+        throw new Error('Runtime unavailable');
+      }
+    });
+    const extraTargets: TuiSession[] = [
+      {
+        sessionId: 'session-restored',
+        title: 'Restored elsewhere',
+        workspaceDir: '/workspace',
+        updatedAt: NOW - 1000,
+        archived: true,
+      },
+      {
+        sessionId: 'session-cron',
+        title: 'Cron-owned investigation',
+        workspaceDir: '/workspace',
+        updatedAt: NOW - 2000,
+        archived: true,
+      },
+      {
+        sessionId: 'session-broken',
+        title: 'Broken delete',
+        workspaceDir: '/workspace',
+        updatedAt: NOW - 3000,
+        archived: true,
+      },
+    ];
+    const onEnumerateArchived = vi.fn(async () => [
+      sessionById('session-archived'),
+      ...extraTargets,
+    ]);
+    const { manager } = createManager({
+      sessions: [...sessions, ...extraTargets],
+      onDelete,
+      onEnumerateArchived,
+    });
+    manager.handleInput('\t');
+
+    manager.handleInput('\x05');
+    await vi.waitFor(() =>
+      expect(renderPlain(manager)).toContain('Permanently delete 4 archived sessions'),
+    );
+    manager.handleInput('\r');
+    await vi.waitFor(() => expect(onDelete).toHaveBeenCalledTimes(4));
+    await flushActions();
+
+    expect(renderPlain(manager)).toContain(
+      'Deleted 1 session. Skipped 1 (restored). Kept 1 (scheduled task). 1 failed.',
+    );
+    // The deleted row is removed; refused and failed rows stay listed.
+    expect(renderPlain(manager)).not.toContain('Archived investigation');
+    expect(renderPlain(manager)).toContain('Restored elsewhere');
+    expect(renderPlain(manager)).toContain('Cron-owned investigation');
+    expect(renderPlain(manager)).toContain('Broken delete');
+  });
+
+  it('states branch retention on both delete confirmation panels', async () => {
+    const { manager } = createManager();
+    manager.handleInput('\t');
+
+    manager.handleInput('\x18');
+    expect(renderPlain(manager)).toContain('Delete session?');
+    expect(renderPlain(manager)).toContain('re-attached to their parent chain');
+    manager.handleInput('\x1b');
+
+    manager.handleInput('\x05');
+    await vi.waitFor(() =>
+      expect(renderPlain(manager)).toContain('Permanently delete 1 archived session'),
+    );
+    expect(renderPlain(manager)).toContain('Delete all archived sessions?');
+    expect(renderPlain(manager)).toContain('re-attached to their parent chain');
   });
 
   it('reports zero archived sessions without asking for confirmation', async () => {

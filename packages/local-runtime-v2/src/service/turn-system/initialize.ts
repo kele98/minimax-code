@@ -117,6 +117,9 @@ export async function initializeTurnSystem(
     beginProcessDeletion: (sessionId) => options.sessions.sessions.deletion.begin(sessionId),
     completeProcessDeletion: (sessionId) => options.sessions.sessions.deletion.complete(sessionId),
     disposeRuntimeSession: options.disposeRuntimeSession,
+    ...(options.onSessionDeletionReleaseFailure
+      ? { onSessionDeletionReleaseFailure: options.onSessionDeletionReleaseFailure }
+      : {}),
   });
   const steer = createSteerSessionService({
     turns: execution,

@@ -73,8 +73,7 @@ import type { McodeCodexOAuthStatus, McodeProviderTemplate } from '../../../prov
 import { McodePluginApplication } from '../../../plugin/application.js';
 import type { McodePluginRuntimeAccess, McodePluginView } from '../../../plugin/contract.js';
 import { formatTuiActionFailure } from '../../../user-facing-failure.js';
-import { isTuiInternalSubagentSession } from '../../../runtime/delegation.js';
-import { isSurfaceableHiddenBranch } from '../../../runtime/session-visibility.js';
+import { isSessionManagerVisible } from '../../../runtime/session-visibility.js';
 import type { TuiTranscriptExporter } from '../../../host/transcript-export.js';
 import { TuiSessionForkFlow } from '../session-fork-flow.js';
 import { hyperlink } from '../../engine/public.js';
@@ -597,10 +596,7 @@ export class TuiFeatureFlow {
           seenCursors.add(cursor);
         }
         return collected.filter(
-          (session) =>
-            session.archived === true &&
-            !isTuiInternalSubagentSession(session) &&
-            (session.visibility !== 'hidden' || isSurfaceableHiddenBranch(session)),
+          (session) => session.archived === true && isSessionManagerVisible(session),
         );
       },
       onCancel: () => this.options.surface.close(manager),

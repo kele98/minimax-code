@@ -94,6 +94,12 @@ export type SessionHistoryIdentity = Pick<
   'sessionId' | 'createdAtMs' | 'historyRelativeDir'
 >;
 
+/** Options for the terminal Session row delete. */
+export interface SessionDeleteOptions {
+  /** Guard the row delete on `archived = 1`, evaluated inside the delete transaction. */
+  readonly expectedArchived?: boolean;
+}
+
 export interface SessionCreateInput {
   readonly sessionId: string;
   readonly agentName: string;
@@ -356,7 +362,14 @@ export interface SessionRepository {
   ): Promise<SessionRecord | undefined>;
   /** Remove scheduled-task ownership while preserving the conversation and its content. */
   detachCronSessions(originCronId: string, targetSessionId?: string): Promise<SessionRecord[]>;
-  delete(sessionId: string): Promise<void>;
+  /**
+   * Deletes the terminal Session row (plus its search/agent-state side rows).
+   * `expectedArchived` makes the row delete conditional on the archived flag,
+   * evaluated atomically inside the same transaction; refusing throws
+   * SessionServiceError('session-not-archived') while an already-missing row
+   * stays an idempotent success.
+   */
+  delete(sessionId: string, opts?: SessionDeleteOptions): Promise<void>;
   touch(sessionId: string, updatedAtMs?: number): Promise<void>;
   swapRoot(input: SessionRootSwapInput): Promise<SessionRootSwapResult>;
   reparentChildren(parentSessionId: string, nextParentSessionId: string | null): Promise<void>;

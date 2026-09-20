@@ -43,7 +43,11 @@ import { toSessionInfoView } from "./wire.js";
 
 export interface SessionDeletionApplicationPorts {
   readonly deletion: {
-    deleteSession(sessionId: string): Promise<unknown>;
+    /**
+     * `expectedArchived` refuses the delete when the session is no longer
+     * archived; it is enforced before any durable deletion state is acquired.
+     */
+    deleteSession(sessionId: string, expectedArchived?: boolean): Promise<unknown>;
   };
 }
 
@@ -263,7 +267,9 @@ export class SessionLifecycleApplication {
     req: DeleteSessionReq,
   ): Promise<DeleteSessionResp> {
     return this.withSessionLifecycle("delete", async () => {
-      await this.deleteSessionById(req.id);
+      // Thread the archived expectation through deleteSessionById so the cron
+      // ownership assert still runs first and keeps its specific error.
+      await this.deleteSessionById(req.id, req.expectedArchived === true);
       return { success: true };
     });
   }
@@ -296,9 +302,9 @@ export class SessionLifecycleApplication {
     await this.setArchived(sessionId, true, lane);
   }
 
-  async deleteSessionById(sessionId: string): Promise<void> {
+  async deleteSessionById(sessionId: string, expectedArchived = false): Promise<void> {
     await this.options.assertSessionDeletionAllowed?.(sessionId);
-    await this.invoke(() => this.options.deletion.deleteSession(sessionId));
+    await this.invoke(() => this.options.deletion.deleteSession(sessionId, expectedArchived));
   }
 
   /** Used by the owning scheduled-task lifecycle after its definition is removed. */
@@ -566,6 +572,7 @@ const LIFECYCLE_FAILURES: Readonly<
     status: 503,
     key: "TASK_AGENT_CAPTURE_UNAVAILABLE",
   },
+  "session-not-archived": { status: 409, key: "SESSION_NOT_ARCHIVED" },
 };
 
 function lifecycleFailureMapping(reason: SessionServiceError["reason"]): {

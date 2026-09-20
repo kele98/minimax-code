@@ -91,7 +91,7 @@ export function createNativeSessionRecordService(
       },
       update: (sessionId, fields, expectedModel, expectedTitle) =>
         sessionRepository.update(sessionId, fields, expectedModel, expectedTitle),
-      delete: (sessionId) => sessionRepository.delete(sessionId),
+      delete: (sessionId, opts) => sessionRepository.delete(sessionId, opts),
     },
     agents: {
       getDefaults: async (agentName) => {

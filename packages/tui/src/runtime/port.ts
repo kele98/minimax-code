@@ -212,7 +212,11 @@ export interface TuiSessionPort {
   listMessagePage(sessionId: string, input?: TuiMessagePageInput): Promise<TuiMessagePage>;
   renameSession(sessionId: string, title: string): Promise<TuiSession>;
   archiveSession(sessionId: string, archived: boolean): Promise<void>;
-  deleteSession(sessionId: string): Promise<void>;
+  /**
+   * `expectedArchived` asks the runtime to refuse the delete when the session
+   * is no longer archived (used by the archived-view delete flows).
+   */
+  deleteSession(sessionId: string, options?: { expectedArchived?: boolean }): Promise<void>;
   listSessionInputSummaries(
     sessionId: string,
     input?: { limit?: number; before?: string },

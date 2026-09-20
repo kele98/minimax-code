@@ -1,5 +1,6 @@
 import { KeyedOperationLane } from '@mavis/shared/keyed-operation-lane';
 
+import { SessionServiceError } from '../../session-system/sessions/errors.js';
 import type { TurnController } from '../execution/contracts.js';
 import type { TurnRepository } from '../persistence/contracts.js';
 import type { QueueDispatcher } from '../queue.dispatcher.js';
@@ -19,6 +20,11 @@ export interface SessionTurnDeletionServiceOptions {
   ) => Promise<{ readonly status: 'started' | 'already-deleting' | 'not-found' }>;
   readonly completeProcessDeletion: (sessionId: string) => void;
   readonly disposeRuntimeSession: (sessionId: string) => Promise<void>;
+  /** Best-effort sink for release failures during a refused deletion. */
+  readonly onSessionDeletionReleaseFailure?: (input: {
+    readonly sessionId: string;
+    readonly error: unknown;
+  }) => void;
 }
 
 export function createSessionTurnDeletionService(
@@ -42,12 +48,49 @@ export function createSessionTurnDeletionService(
         await requireQuiescentTurn(options, sessionId);
         await options.disposeRuntimeSession(sessionId);
         await options.repository.deleteSessionData(sessionId);
-        await cleanup();
+        try {
+          await cleanup();
+        } catch (error) {
+          // The guarded terminal row delete refused the session (it was
+          // restored while deletion was pending). The durable deletion state
+          // must be released BEFORE rethrowing, or a restart-resume would pick
+          // the restored session up and delete it unconditionally.
+          if (error instanceof SessionServiceError && error.reason === 'session-not-archived') {
+            await releaseSessionDeletionState(options, sessionId);
+          }
+          throw error;
+        }
         await options.repository.completeSessionDeletion(sessionId);
         options.completeProcessDeletion(sessionId);
         options.operations.release(sessionId);
       }),
   };
+}
+
+/**
+ * Same release trio as the success path, made best-effort: each release is
+ * reported and skipped on failure so a broken release can never mask the
+ * original session-not-archived refusal.
+ */
+async function releaseSessionDeletionState(
+  options: SessionTurnDeletionServiceOptions,
+  sessionId: string,
+): Promise<void> {
+  try {
+    await options.repository.completeSessionDeletion(sessionId);
+  } catch (error) {
+    options.onSessionDeletionReleaseFailure?.({ sessionId, error });
+  }
+  try {
+    options.completeProcessDeletion(sessionId);
+  } catch (error) {
+    options.onSessionDeletionReleaseFailure?.({ sessionId, error });
+  }
+  try {
+    options.operations.release(sessionId);
+  } catch (error) {
+    options.onSessionDeletionReleaseFailure?.({ sessionId, error });
+  }
 }
 
 async function requireQuiescentTurn(

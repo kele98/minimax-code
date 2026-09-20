@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { TuiRuntimeAdapter } from "../../src/runtime/adapter.js";
+import { TuiSessionAccess } from "../../src/runtime/adapters/session-access.js";
 
 describe("TuiRuntimeAdapter process-local facades", () => {
   it("projects active and recent terminal Runtime background work for the current Session", async () => {
@@ -794,4 +795,44 @@ describe("TuiRuntimeAdapter process-local facades", () => {
       });
     },
   );
+
+  it("runs local session cleanup only after a successful runtime delete", async () => {
+    const order: string[] = [];
+    const onSessionDeleted = vi.fn(async (sessionId: string) => {
+      order.push(`cleanup:${sessionId}`);
+    });
+    const access = new TuiSessionAccess(
+      {
+        deleteSession: vi.fn(async (req: { id: string; expectedArchived?: boolean }) => {
+          order.push(`delete:${req.id}:${req.expectedArchived === true}`);
+        }),
+      } as never,
+      "mavis",
+      onSessionDeleted,
+    );
+
+    await access.deleteSession("session-1", { expectedArchived: true });
+
+    expect(order).toEqual(["delete:session-1:true", "cleanup:session-1"]);
+  });
+
+  it("skips local session cleanup when the runtime delete is refused", async () => {
+    const onSessionDeleted = vi.fn();
+    const access = new TuiSessionAccess(
+      {
+        deleteSession: vi.fn(async () => {
+          throw new Error("This session is no longer archived.");
+        }),
+      } as never,
+      "mavis",
+      onSessionDeleted,
+    );
+
+    await expect(access.deleteSession("session-1", { expectedArchived: true })).rejects.toThrow(
+      "no longer archived",
+    );
+
+    // A refusal must never destroy browser-session resources first.
+    expect(onSessionDeleted).not.toHaveBeenCalled();
+  });
 });

@@ -885,6 +885,12 @@ export interface GetSessionDiffResult {
 
 export interface DeleteSessionInput {
   id: string;
+  /**
+   * Refuse the delete unless the session is still archived at execution time.
+   * Guards the archived-view flows against a restore that lands after the
+   * caller confirmed. Omitting it keeps the unconditional delete semantics.
+   */
+  expectedArchived?: boolean;
 }
 
 export interface DeleteSessionResult {

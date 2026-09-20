@@ -256,8 +256,11 @@ export class TuiRuntimeAdapter implements TuiRuntime {
   archiveSession(sessionId: string, archived: boolean): Promise<void> {
     return this.sessionAccess.archiveSession(sessionId, archived);
   }
-  deleteSession(sessionId: string): Promise<void> {
-    return this.sessionAccess.deleteSession(sessionId);
+  deleteSession(
+    sessionId: string,
+    options?: { expectedArchived?: boolean },
+  ): Promise<void> {
+    return this.sessionAccess.deleteSession(sessionId, options);
   }
   listSessionInputSummaries(
     sessionId: string,

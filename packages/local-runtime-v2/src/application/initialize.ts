@@ -1,5 +1,6 @@
 import type { V1SessionCompatibility } from "../compat/v1/session.js";
 import type { InitializedSessionApplicationSystem } from "../service/session-system/index.js";
+import { SessionServiceError } from "../service/session-system/index.js";
 import type { TurnService } from "../service/turn-system/index.js";
 import type { LocalAttachmentRegistrationPort } from "./conversation/attachment-registration.js";
 import { QueueApplication } from "./queue/queue-application.js";
@@ -110,10 +111,25 @@ export const initializeApplications: InitializeApplications = (options) => {
       ? { endPluginHookSession: options.endPluginHookSession }
       : {}),
     deletion: {
-      deleteSession: (sessionId) =>
-        options.turn.sessionDeletion(sessionId, async () => {
-          await deletion.deleteSession(sessionId);
-        }),
+      deleteSession: async (sessionId, expectedArchived) => {
+        // Authoritative pre-check, deliberately BEFORE the deletion fence: a
+        // refusal here must run ahead of beginProcessDeletion so no durable
+        // deletion state, turn abort, or history cleanup happens for a session
+        // that was restored while deletion was pending. The repo's guarded row
+        // delete covers the residual window after this read.
+        if (expectedArchived === true) {
+          const record = await options.sessionSystem.repositories.sessions.get(sessionId);
+          if (record && record.archived !== true) {
+            throw new SessionServiceError(
+              "session-not-archived",
+              "This session is no longer archived. It was restored while deletion was pending.",
+            );
+          }
+        }
+        await options.turn.sessionDeletion(sessionId, async () => {
+          await deletion.deleteSession(sessionId, expectedArchived);
+        });
+      },
     },
     ...(options.assertSessionDeletionAllowed
       ? { assertSessionDeletionAllowed: options.assertSessionDeletionAllowed }

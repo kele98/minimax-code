@@ -79,7 +79,9 @@ import {
   SessionRootSwapError,
   SessionTitleConflictError,
   SessionUniqueViolation,
+  type SessionDeleteOptions,
 } from './contract.js';
+import { SessionServiceError } from '../errors.js';
 import { sessionAgentNamePredicate } from './agent-name-predicate.js';
 import { sessionListPredicate } from './drizzle/list-predicates.js';
 import {
@@ -471,11 +473,35 @@ class DrizzleSessionRepository implements SessionRepository {
     this.writeUpsert(record, true);
   }
 
-  async delete(sessionId: string): Promise<void> {
+  async delete(sessionId: string, opts?: SessionDeleteOptions): Promise<void> {
     this.options.db.transaction((tx) => {
       deleteSessionSearchDocument(tx, sessionId);
       tx.delete(sessionAgentState).where(eq(sessionAgentState.sessionId, sessionId)).run();
-      tx.delete(sessions).where(eq(sessions.sessionId, sessionId)).run();
+      const result = tx
+        .delete(sessions)
+        .where(
+          opts?.expectedArchived === true
+            ? and(eq(sessions.sessionId, sessionId), eq(sessions.archived, 1))
+            : eq(sessions.sessionId, sessionId),
+        )
+        .run();
+      // A guarded delete that matched nothing either found the row already
+      // removed (idempotent retry) or restored after the fence pre-check.
+      // Distinguish them inside the same transaction so a refusal rolls the
+      // search-document and agent-state deletions back with it.
+      if (opts?.expectedArchived === true && result.changes === 0) {
+        const surviving = tx
+          .select({ sessionId: sessions.sessionId })
+          .from(sessions)
+          .where(eq(sessions.sessionId, sessionId))
+          .get();
+        if (surviving) {
+          throw new SessionServiceError(
+            'session-not-archived',
+            'This session is no longer archived. It was restored while deletion was pending.',
+          );
+        }
+      }
     });
   }
 

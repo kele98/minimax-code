@@ -15,11 +15,8 @@ import { truncateToWidth, visibleWidth } from '../../rendering/text.js';
 import { Input } from '../../widgets/input.js';
 import { sanitizeTerminalText } from '../../rendering/terminal-text.js';
 import type { TuiSession } from '../../../runtime/port.js';
-import {
-  isTuiDelegatedSession,
-  isTuiInternalSubagentSession,
-} from '../../../runtime/delegation.js';
-import { isSurfaceableHiddenBranch } from '../../../runtime/session-visibility.js';
+import { isTuiDelegatedSession } from '../../../runtime/delegation.js';
+import { isSessionManagerVisible } from '../../../runtime/session-visibility.js';
 import { tuiChalk as chalk, tuiColors as colors } from '../../theme/runtime.js';
 import { formatTuiActionFailure } from '../../../user-facing-failure.js';
 
@@ -659,8 +656,14 @@ export class TuiSessionManager implements Component, Focusable {
         title: 'Delete session?',
         body: [
           sanitizeTerminalText(target?.title?.trim() || target?.sessionId || 'Unknown session'),
+          // Two body rows instead of one: renderPanelFrame truncates each body
+          // line to the frame width instead of wrapping, so a single combined
+          // line would lose the tail.
           chalk.hex(colors.muted)(
-            'Session and messages will be permanently deleted. This cannot be undone. Branches are kept.',
+            'Session and messages will be permanently deleted. This cannot be undone.',
+          ),
+          chalk.hex(colors.muted)(
+            'Branches are kept and re-attached to their parent chain.',
           ),
         ],
         footer: 'Enter delete · Esc cancel',
@@ -686,8 +689,11 @@ export class TuiSessionManager implements Component, Focusable {
       );
       body.push(
         chalk.hex(colors.muted)(
-          'This cannot be undone. Branches are kept. Sessions owned by scheduled tasks are kept.',
+          'This cannot be undone. Branches are kept and re-attached to their parent chain.',
         ),
+      );
+      body.push(
+        chalk.hex(colors.muted)('Sessions owned by scheduled tasks are kept.'),
       );
     }
     return renderPanelFrame(
@@ -718,11 +724,7 @@ export class TuiSessionManager implements Component, Focusable {
   }
 
   private scopedSessions(): TuiSession[] {
-    const visibleCatalog = this.sessions.filter(
-      (session) =>
-        !isTuiInternalSubagentSession(session) &&
-        (session.visibility !== 'hidden' || isSurfaceableHiddenBranch(session)),
-    );
+    const visibleCatalog = this.sessions.filter(isSessionManagerVisible);
     if (this.scope === 'all') return visibleCatalog;
     const workspace = normalizeWorkspace(this.options.workspaceDir);
     return visibleCatalog.filter(
@@ -1056,14 +1058,29 @@ export class TuiSessionManager implements Component, Focusable {
       try {
         // An in-flight page load can re-add the deleted row on merge; wait it out.
         if (this.pageLoad) await this.pageLoad;
-        // Another host may have restored the session while this panel was open,
-        // and the awaited page merge may have brought the restored copy in.
+        // Fast-path UX re-check only: the runtime's conditional delete is
+        // load-bearing and refuses restores this local copy cannot see.
         const current = this.sessions.find((session) => session.sessionId === target.sessionId);
         if (current && current.archived !== true) {
           this.setStatus('Session is no longer archived.', 'info');
           return;
         }
-        await this.options.onDelete(target.sessionId);
+        try {
+          await this.options.onDelete(target.sessionId);
+        } catch (error) {
+          // Known runtime refusals keep the row with a specific status; any
+          // other error is a failure and falls through to the formatted path.
+          const refusal = classifySessionDeleteRefusal(error);
+          if (refusal === 'restored') {
+            this.setStatus('Session is no longer archived.', 'info');
+            return;
+          }
+          if (refusal === 'cron') {
+            this.setStatus('Session is owned by a scheduled task. It was kept.', 'info');
+            return;
+          }
+          throw error;
+        }
         if (!this.disposed) {
           this.sessions = this.sessions.filter(
             (session) => session.sessionId !== target.sessionId,
@@ -1095,7 +1112,9 @@ export class TuiSessionManager implements Component, Focusable {
       // An in-flight page load can re-add deleted rows on merge; wait it out.
       if (this.pageLoad) await this.pageLoad;
       let deleted = 0;
-      let skipped = 0;
+      let restored = 0;
+      let cron = 0;
+      let failed = 0;
       for (let index = 0; index < targets.length; index += 1) {
         const target = targets[index];
         try {
@@ -1113,18 +1132,25 @@ export class TuiSessionManager implements Component, Focusable {
             };
             this.requestRender();
           }
-        } catch {
-          // e.g. cron-owned sessions throw 409; keep the row and continue.
-          skipped += 1;
+        } catch (error) {
+          // Refused deletes keep the row; only known runtime refusal keys
+          // count as skips so unexpected failures stay visible in the summary.
+          const refusal = classifySessionDeleteRefusal(error);
+          if (refusal === 'restored') restored += 1;
+          else if (refusal === 'cron') cron += 1;
+          else failed += 1;
         }
       }
       // The loop continues after dispose: the user confirmed the batch, and
       // stopping midway would leave a half-emptied archive with no summary.
       if (this.disposed) return;
       this.setStatus(
-        `Deleted ${deleted} session${deleted === 1 ? '' : 's'}.${
-          skipped > 0 ? ` Skipped ${skipped}.` : ''
-        }`,
+        [
+          `Deleted ${deleted} session${deleted === 1 ? '' : 's'}.`,
+          restored > 0 ? ` Skipped ${restored} (restored).` : '',
+          cron > 0 ? ` Kept ${cron} (scheduled task).` : '',
+          failed > 0 ? ` ${failed} failed.` : '',
+        ].join(''),
         'info',
       );
       this.requestRender();
@@ -1246,6 +1272,21 @@ function mergeSessions(
   const byId = new Map(current.map((session) => [session.sessionId, session]));
   for (const session of incoming) byId.set(session.sessionId, session);
   return sortSessions([...byId.values()]);
+}
+
+type SessionDeleteRefusal = 'restored' | 'cron' | 'failed';
+
+/**
+ * Classifies a runtime delete refusal by its stable error key. Only the
+ * known refusal keys count as skips; everything else is a real failure and
+ * keeps the formatted error path.
+ */
+function classifySessionDeleteRefusal(error: unknown): SessionDeleteRefusal {
+  if (typeof error !== 'object' || error === null) return 'failed';
+  const { key } = error as { key?: unknown };
+  if (key === 'SESSION_NOT_ARCHIVED') return 'restored';
+  if (key === 'CRON_OWNED_SESSION') return 'cron';
+  return 'failed';
 }
 
 function toTimestamp(value: number | string | undefined): number {

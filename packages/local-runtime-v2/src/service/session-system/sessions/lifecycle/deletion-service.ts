@@ -1,4 +1,4 @@
-import type { SessionRecord } from '../repo/contract.js';
+import type { SessionDeleteOptions, SessionRecord } from '../repo/contract.js';
 import { isPeekSession } from '../repo/normalization.js';
 import { SessionServiceError } from '../errors.js';
 import type { SessionFactSink } from './record-service.js';
@@ -9,7 +9,9 @@ export interface SessionDeletionServiceOptions {
     reparentChildren(sessionId: string, parentSessionId: string | null): Promise<void>;
   };
   readonly clearSessionReference: (session: SessionRecord) => Promise<void>;
-  readonly records: { deleteSessionRecord(sessionId: string): Promise<void> };
+  readonly records: {
+    deleteSessionRecord(sessionId: string, opts?: SessionDeleteOptions): Promise<void>;
+  };
 
   readonly cleanup: {
     deleteCanvas(sessionId: string): Promise<void>;
@@ -33,7 +35,10 @@ export interface SessionDeletionServiceOptions {
 export class SessionDeletionService {
   constructor(private readonly options: SessionDeletionServiceOptions) {}
 
-  async deleteSession(sessionId: string): Promise<SessionRecord | undefined> {
+  async deleteSession(
+    sessionId: string,
+    expectedArchived?: boolean,
+  ): Promise<SessionRecord | undefined> {
     const current = await this.options.sessions.get(sessionId);
     if (!current) return undefined;
     if (current.runtime !== 'pi-agent') {
@@ -62,7 +67,12 @@ export class SessionDeletionService {
     await this.options.cleanup.removePin(sessionId);
     await this.options.sessions.reparentChildren(sessionId, current.parentSessionId ?? null);
     await this.options.clearSessionReference(current);
-    await this.options.records.deleteSessionRecord(sessionId);
+    // `expectedArchived` reaches the repo's terminal row delete so it can
+    // refuse atomically when the session was restored mid-cleanup.
+    await this.options.records.deleteSessionRecord(
+      sessionId,
+      expectedArchived === true ? { expectedArchived: true } : undefined,
+    );
     this.options.facts.handle({ kind: 'deleted', sessionId });
     return current;
   }

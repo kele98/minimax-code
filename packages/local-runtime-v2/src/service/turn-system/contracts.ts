@@ -644,6 +644,11 @@ export interface InitializeTurnSystemOptions {
     readonly sessionId: string;
     readonly error: unknown;
   }) => void;
+  /** Best-effort sink for durable-state release failures during a refused Session deletion. */
+  readonly onSessionDeletionReleaseFailure?: (input: {
+    readonly sessionId: string;
+    readonly error: unknown;
+  }) => void;
   readonly disposeRuntimeSession: (sessionId: string) => Promise<void>;
   readonly admissionPolicy?: TurnAdmissionPolicy;
   readonly submissionPreparation?: TurnSubmissionPreparation;

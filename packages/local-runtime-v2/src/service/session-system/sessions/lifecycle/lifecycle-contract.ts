@@ -8,6 +8,7 @@ import type {
   SessionRecord,
   SessionKind,
   SessionOrigin,
+  SessionDeleteOptions,
   SessionModelSnapshot,
 } from '../repo/contract.js';
 import type { ConversationModelThinkingSelection } from '@mavis/conversation-contract';
@@ -75,5 +76,5 @@ export interface SessionMetadataWriter {
     expectedModel?: SessionModelSnapshot,
     expectedTitle?: string | null,
   ): Promise<SessionRecord | undefined>;
-  delete(sessionId: string): Promise<void>;
+  delete(sessionId: string, opts?: SessionDeleteOptions): Promise<void>;
 }

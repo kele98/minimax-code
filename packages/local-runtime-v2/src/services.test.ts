@@ -36,6 +36,18 @@ import {
   type CreateRuntimeServicesOptions,
   type RuntimeServices,
 } from "./services.js";
+// Composition imports for the conditional-delete tests below. They stay at the
+// END of the import list: evaluating application/initialize.js transitively
+// requests the mocked turn-system barrel, whose factory references bindings
+// (requireAgentRuntime, …) that must already be initialized.
+import { AppError } from "./application/errors.js";
+import { initializeApplications } from "./application/initialize.js";
+import { SessionServiceError } from "./service/session-system/sessions/errors.js";
+import { SessionDeletionService } from "./service/session-system/sessions/lifecycle/deletion-service.js";
+import type { SessionRecord } from "./service/session-system/sessions/repo/contract.js";
+import { createSessionRepository } from "./service/session-system/sessions/repo/drizzle.js";
+import { createSessionOperationGate } from "./service/turn-system/lifecycle/session-operation-gate.js";
+import { createSessionTurnDeletionService } from "./service/turn-system/lifecycle/session-turn-deletion.js";
 
 type QueueClassifier = NonNullable<
   InitializeTurnSystemOptions["classifyQueuedItem"]
@@ -620,6 +632,9 @@ vi.mock("./service/session-system/index.js", async (importOriginal) => {
   return {
     isCurrentSessionAgentDefinition: actual.isCurrentSessionAgentDefinition,
     isTaskSession: actual.isTaskSession,
+    // Real error class so the real SessionLifecycleApplication (composed in
+    // the conditional-delete tests below) can map SessionServiceError reasons.
+    SessionServiceError: actual.SessionServiceError,
     ComposerSendBehaviorPreference: actual.ComposerSendBehaviorPreference,
     retryUserMessageCommit: <T>(operation: () => Promise<T>) => operation(),
     createCanonicalRecoveryLoggerAdapter:
@@ -4302,5 +4317,387 @@ describe("runtime services primary family execution identity", () => {
       executionOwnerName: "explore",
     });
     expect(info).not.toHaveBeenCalled();
+  });
+});
+
+describe("runtime conditional Session deletion", () => {
+  function conditionalDeleteRecord(overrides: {
+    readonly archived: boolean;
+    readonly sessionId?: string;
+  }): SessionRecord {
+    return {
+      sessionId: overrides.sessionId ?? "session-conditional",
+      agentName: "mavis",
+      workspaceDir: "/workspace",
+      runtime: "pi-agent",
+      sessionType: "root",
+      sessionKind: "conversation",
+      archived: overrides.archived,
+      status: "idle",
+      createdAtMs: 1,
+      updatedAtMs: 2,
+    };
+  }
+
+  /**
+   * Composes the real application wiring (pre-check + fence wrapper + real
+   * SessionDeletionService) against mocked ports, mirroring how the production
+   * graph wires lifecycle deletion. The fence itself is a mock so the tests
+   * can observe whether it was entered at all.
+   */
+  function createConditionalDeleteComposition(input: {
+    readonly record?: SessionRecord | undefined;
+    readonly cronOwned?: boolean;
+  } = {}) {
+    const sequence: string[] = [];
+    const precheckGet = vi.fn(async () => input.record);
+    const turnSessionDeletion = vi.fn(
+      async (_sessionId: string, cleanup: () => Promise<void>) => {
+        sequence.push("fence:enter");
+        await cleanup();
+        sequence.push("fence:complete");
+      },
+    );
+    const cleanupPort = (name: string) =>
+      vi.fn(async () => {
+        sequence.push(`cleanup:${name}`);
+      });
+    const deleteSessionRecord = vi.fn(
+      async (
+        _sessionId: string,
+        opts?: { readonly expectedArchived?: boolean },
+      ) => {
+        sequence.push(
+          `records:delete:${opts?.expectedArchived === true ? "guarded" : "unguarded"}`,
+        );
+      },
+    );
+    const reparentChildren = vi.fn(async () => {
+      sequence.push("sessions:reparent");
+    });
+    const deletion = new SessionDeletionService({
+      sessions: {
+        get: vi.fn(async () => input.record),
+        reparentChildren,
+      },
+      clearSessionReference: vi.fn(async () => {
+        sequence.push("reference:clear");
+      }),
+      records: { deleteSessionRecord },
+      cleanup: {
+        deleteCanvas: cleanupPort("canvas"),
+        deleteArtifacts: cleanupPort("artifacts"),
+        deleteDiff: cleanupPort("diff"),
+        deleteCommunication: cleanupPort("communication"),
+        deleteChannelBindings: cleanupPort("channel-bindings"),
+        deleteQuestionnaires: cleanupPort("questionnaires"),
+        deletePermissions: cleanupPort("permissions"),
+        deleteGoal: cleanupPort("goal"),
+        deleteQueryCollapse: cleanupPort("query-collapse"),
+        removePin: cleanupPort("pin"),
+        markLegacyMigrationDeleted: cleanupPort("legacy-migration"),
+      },
+      facts: { handle: vi.fn() },
+    });
+    const assertSessionDeletionAllowed = input.cronOwned
+      ? vi.fn(async () => {
+          sequence.push("assert:cron");
+          throw new AppError(
+            409,
+            "CRON_OWNED_SESSION",
+            "This session is owned by a scheduled task. Delete the scheduled task instead.",
+          );
+        })
+      : vi.fn(async () => {
+          sequence.push("assert:cron");
+        });
+    const applications = initializeApplications({
+      sessionSystem: {
+        repositories: { sessions: { get: precheckGet } },
+        session: {
+          lifecycle: {},
+          deletion: { create: () => deletion },
+          query: {},
+          maintenance: {},
+        },
+        messages: {},
+        files: {},
+        usage: {},
+        queryCollapse: {},
+        diff: {},
+        root: {},
+        queue: {},
+      },
+      compatibility: { diff: { capability: {} } },
+      attachmentRegistration: {},
+      resolveAgentWriteTarget: vi.fn(async (requestRef: string) => requestRef),
+      requireExactAgentKey: vi.fn(async (name: string) => name),
+      turn: { sessionDeletion: turnSessionDeletion, submit: vi.fn() },
+      publishGlobalEvent: vi.fn(),
+      assertSessionDeletionAllowed,
+      conversationMutationPort: {},
+    } as unknown as Parameters<typeof initializeApplications>[0]);
+    return {
+      applications,
+      sequence,
+      precheckGet,
+      turnSessionDeletion,
+      deleteSessionRecord,
+      reparentChildren,
+    };
+  }
+
+  it("refuses a conditional delete before the deletion fence when the session is no longer archived", async () => {
+    const record = conditionalDeleteRecord({ archived: false });
+    const { applications, sequence, turnSessionDeletion, deleteSessionRecord } =
+      createConditionalDeleteComposition({ record });
+
+    await expect(
+      applications.session.lifecycle.deleteSession({} as never, {
+        id: record.sessionId,
+        expectedArchived: true,
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      key: "SESSION_NOT_ARCHIVED",
+      message: "This session is no longer archived. It was restored while deletion was pending.",
+    });
+
+    // The refusal happened ahead of the fence, so no durable deletion state was
+    // acquired (beginProcessDeletion lives inside the fence) and no cleanup
+    // port or terminal row delete ran.
+    expect(turnSessionDeletion).not.toHaveBeenCalled();
+    expect(deleteSessionRecord).not.toHaveBeenCalled();
+    expect(sequence).toEqual(["assert:cron"]);
+  });
+
+  it("keeps the archived delete unchanged and threads the guard into the terminal row delete", async () => {
+    const record = conditionalDeleteRecord({ archived: true });
+    const { applications, sequence, turnSessionDeletion, deleteSessionRecord, reparentChildren } =
+      createConditionalDeleteComposition({ record });
+
+    await expect(
+      applications.session.lifecycle.deleteSession({} as never, {
+        id: record.sessionId,
+        expectedArchived: true,
+      }),
+    ).resolves.toEqual({ success: true });
+
+    expect(turnSessionDeletion).toHaveBeenCalledWith(
+      record.sessionId,
+      expect.any(Function),
+    );
+    // The cleanups still run and the guard reaches the terminal row delete.
+    expect(sequence).toContain("cleanup:legacy-migration");
+    expect(sequence).toContain("cleanup:canvas");
+    expect(sequence).toContain("sessions:reparent");
+    expect(reparentChildren).toHaveBeenCalledWith(record.sessionId, null);
+    expect(deleteSessionRecord).toHaveBeenCalledWith(record.sessionId, {
+      expectedArchived: true,
+    });
+    expect(sequence).toContain("fence:complete");
+  });
+
+  it("keeps the cron ownership refusal ahead of the archived pre-check", async () => {
+    const record = conditionalDeleteRecord({ archived: false });
+    const { applications, sequence, precheckGet, turnSessionDeletion } =
+      createConditionalDeleteComposition({ record, cronOwned: true });
+
+    await expect(
+      applications.session.lifecycle.deleteSession({} as never, {
+        id: record.sessionId,
+        expectedArchived: true,
+      }),
+    ).rejects.toMatchObject({ status: 409, key: "CRON_OWNED_SESSION" });
+
+    // The cron assert throws before the archived pre-check reads the record,
+    // so cron-owned sessions keep their specific error.
+    expect(precheckGet).not.toHaveBeenCalled();
+    expect(turnSessionDeletion).not.toHaveBeenCalled();
+    expect(sequence).toEqual(["assert:cron"]);
+  });
+
+  it("treats a missing session as an idempotent conditional delete success", async () => {
+    const { applications, sequence, turnSessionDeletion, deleteSessionRecord } =
+      createConditionalDeleteComposition({ record: undefined });
+
+    await expect(
+      applications.session.lifecycle.deleteSession({} as never, {
+        id: "session-gone",
+        expectedArchived: true,
+      }),
+    ).resolves.toEqual({ success: true });
+
+    expect(turnSessionDeletion).toHaveBeenCalledWith("session-gone", expect.any(Function));
+    // The deletion service short-circuits on a missing record exactly as the
+    // repo delete does: no cleanup, no terminal row delete, no error.
+    expect(deleteSessionRecord).not.toHaveBeenCalled();
+    expect(sequence).toEqual(["assert:cron", "fence:enter", "fence:complete"]);
+  });
+
+  it("releases durable deletion state before rethrowing a session-not-archived refusal from the fence", async () => {
+    const repository = {
+      beginSessionDeletion: vi.fn(async () => undefined),
+      readSessionDeletion: vi.fn(async () => ({ status: "quiescent" as const })),
+      deleteSessionData: vi.fn(async () => undefined),
+      completeSessionDeletion: vi.fn(async () => undefined),
+    };
+    const completeProcessDeletion = vi.fn();
+    const operations = createSessionOperationGate();
+    const capability = createSessionTurnDeletionService({
+      repository,
+      controller: {
+        abort: vi.fn(async () => ({ status: "aborted" as const, turnId: "turn-1" })),
+        activeTurnId: vi.fn(() => undefined),
+      },
+      dispatcher: { quiesceSession: vi.fn(async () => undefined) },
+      operations,
+      beginProcessDeletion: vi.fn(async () => ({ status: "started" as const })),
+      completeProcessDeletion,
+      disposeRuntimeSession: vi.fn(async () => undefined),
+      onSessionDeletionReleaseFailure: vi.fn(),
+    });
+    const refusal = new SessionServiceError(
+      "session-not-archived",
+      "This session is no longer archived. It was restored while deletion was pending.",
+    );
+
+    await expect(
+      capability.run("session-1", async () => {
+        throw refusal;
+      }),
+    ).rejects.toBe(refusal);
+
+    // The release trio ran before the rethrow, so a restart-resume cannot pick
+    // the restored session up and later turns can enter the session again.
+    expect(repository.completeSessionDeletion).toHaveBeenCalledWith("session-1");
+    expect(completeProcessDeletion).toHaveBeenCalledWith("session-1");
+    expect(operations.tryEnter("session-1")).toBeDefined();
+  });
+
+  it("does not release durable deletion state for unrelated cleanup errors", async () => {
+    const repository = {
+      beginSessionDeletion: vi.fn(async () => undefined),
+      readSessionDeletion: vi.fn(async () => ({ status: "quiescent" as const })),
+      deleteSessionData: vi.fn(async () => undefined),
+      completeSessionDeletion: vi.fn(async () => undefined),
+    };
+    const completeProcessDeletion = vi.fn();
+    const capability = createSessionTurnDeletionService({
+      repository,
+      controller: {
+        abort: vi.fn(async () => ({ status: "aborted" as const, turnId: "turn-1" })),
+        activeTurnId: vi.fn(() => undefined),
+      },
+      dispatcher: { quiesceSession: vi.fn(async () => undefined) },
+      operations: createSessionOperationGate(),
+      beginProcessDeletion: vi.fn(async () => ({ status: "started" as const })),
+      completeProcessDeletion,
+      disposeRuntimeSession: vi.fn(async () => undefined),
+      onSessionDeletionReleaseFailure: vi.fn(),
+    });
+    const failure = new Error("store cleanup failed");
+
+    await expect(
+      capability.run("session-1", async () => {
+        throw failure;
+      }),
+    ).rejects.toBe(failure);
+
+    // Only a session-not-archived refusal releases; other errors keep the
+    // pre-existing retry-later behavior.
+    expect(repository.completeSessionDeletion).not.toHaveBeenCalled();
+    expect(completeProcessDeletion).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed release step without masking the original refusal", async () => {
+    const releaseFailure = vi.fn();
+    const repository = {
+      beginSessionDeletion: vi.fn(async () => undefined),
+      readSessionDeletion: vi.fn(async () => ({ status: "quiescent" as const })),
+      deleteSessionData: vi.fn(async () => undefined),
+      completeSessionDeletion: vi.fn(async () => {
+        throw new Error("release failed");
+      }),
+    };
+    const completeProcessDeletion = vi.fn();
+    const capability = createSessionTurnDeletionService({
+      repository,
+      controller: {
+        abort: vi.fn(async () => ({ status: "aborted" as const, turnId: "turn-1" })),
+        activeTurnId: vi.fn(() => undefined),
+      },
+      dispatcher: { quiesceSession: vi.fn(async () => undefined) },
+      operations: createSessionOperationGate(),
+      beginProcessDeletion: vi.fn(async () => ({ status: "started" as const })),
+      completeProcessDeletion,
+      disposeRuntimeSession: vi.fn(async () => undefined),
+      onSessionDeletionReleaseFailure: releaseFailure,
+    });
+    const refusal = new SessionServiceError(
+      "session-not-archived",
+      "This session is no longer archived. It was restored while deletion was pending.",
+    );
+
+    await expect(
+      capability.run("session-1", async () => {
+        throw refusal;
+      }),
+    ).rejects.toBe(refusal);
+
+    // The broken release is reported and the remaining trio still runs.
+    expect(releaseFailure).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      error: expect.objectContaining({ message: "release failed" }),
+    });
+    expect(completeProcessDeletion).toHaveBeenCalledWith("session-1");
+  });
+
+  it("refuses the guarded terminal row delete inside the transaction when the session was restored mid-deletion", async () => {
+    const raw = new Database(":memory:");
+    try {
+      const db = migratePluginTestDatabase(raw);
+      const repo = createSessionRepository({ db });
+      const created = await repo.create({
+        sessionId: "session-guarded",
+        agentName: "mavis",
+        workspaceDir: "/workspace",
+        runtime: "pi-agent",
+        archived: true,
+      });
+
+      // The session is restored between the fence pre-check and the terminal
+      // row delete — exactly the residual window layer 2 must close.
+      await repo.update(created.sessionId, { archived: false });
+
+      await expect(
+        repo.delete(created.sessionId, { expectedArchived: true }),
+      ).rejects.toMatchObject({
+        reason: "session-not-archived",
+        message:
+          "This session is no longer archived. It was restored while deletion was pending.",
+      });
+
+      // The refusal rolled the whole transaction back: the row survives…
+      const surviving = await repo.get(created.sessionId);
+      expect(surviving?.archived).toBe(false);
+      // …and so does the search-document deletion that precedes the guarded
+      // row delete in the same transaction. Asserting it pins the check
+      // INSIDE the transaction: moving the throw outside would commit the
+      // search-document deletion for a surviving row.
+      const ftsKeys = raw
+        .prepare("SELECT COUNT(*) AS count FROM local_runtime_session_fts_keys WHERE session_id = ?")
+        .get(created.sessionId) as { count: number };
+      expect(ftsKeys.count).toBeGreaterThan(0);
+
+      // Unconditional deletes keep their semantics and retries stay idempotent.
+      await expect(repo.delete(created.sessionId)).resolves.toBeUndefined();
+      await expect(
+        repo.delete(created.sessionId, { expectedArchived: true }),
+      ).resolves.toBeUndefined();
+      await expect(repo.get(created.sessionId)).resolves.toBeUndefined();
+    } finally {
+      raw.close();
+    }
   });
 });

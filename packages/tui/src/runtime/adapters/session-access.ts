@@ -229,9 +229,18 @@ export class TuiSessionAccess {
     await this.cliService.archiveSession({ id: sessionId, archived });
   }
 
-  async deleteSession(sessionId: string): Promise<void> {
+  async deleteSession(
+    sessionId: string,
+    options?: { expectedArchived?: boolean },
+  ): Promise<void> {
+    await this.cliService.deleteSession({
+      id: sessionId,
+      ...(options?.expectedArchived === true ? { expectedArchived: true } : {}),
+    });
+    // Cleanup follows a successful runtime delete so a refusal (e.g. the
+    // session was restored or is cron-owned) never destroys local
+    // browser-session resources first.
     await this.onSessionDeleted?.(sessionId);
-    await this.cliService.deleteSession({ id: sessionId });
   }
 
   async listSessionInputSummaries(

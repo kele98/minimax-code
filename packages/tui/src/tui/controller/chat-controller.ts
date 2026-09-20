@@ -319,7 +319,9 @@ export class TuiChatController {
     this.assertNoActiveTurn('deleting a session');
     this.invalidateSessionCatalogRefresh();
     const deleteSession = requireRuntimeMethod(this.runtime, 'deleteSession');
-    await deleteSession(sessionId);
+    // Only reachable from the archived view, so ask the runtime to refuse the
+    // delete if the session was restored after the caller confirmed.
+    await deleteSession(sessionId, { expectedArchived: true });
     this.updateState({
       sessions: this.state.sessions.filter((session) => session.sessionId !== sessionId),
       error: undefined,

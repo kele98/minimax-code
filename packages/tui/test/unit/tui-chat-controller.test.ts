@@ -2751,7 +2751,7 @@ describe('TuiChatController', () => {
 
     await controller.deleteSession('session-2');
 
-    expect(runtime.deleteSession).toHaveBeenCalledWith('session-2');
+    expect(runtime.deleteSession).toHaveBeenCalledWith('session-2', { expectedArchived: true });
     expect(controller.snapshot().sessions.map((session) => session.sessionId)).not.toContain(
       'session-2',
     );

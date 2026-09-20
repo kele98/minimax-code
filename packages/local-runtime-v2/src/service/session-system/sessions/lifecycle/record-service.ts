@@ -10,6 +10,7 @@ import type {
   SessionKind,
   SessionOrigin,
   SessionAgentDefinitionBackfill,
+  SessionDeleteOptions,
   SessionPage,
   SessionRecord,
   SessionModelSnapshot,
@@ -835,8 +836,8 @@ export class SessionRecordService
     return updated;
   }
 
-  deleteSessionRecord(sessionId: string): Promise<void> {
-    return this.deps.metadata.delete(sessionId);
+  deleteSessionRecord(sessionId: string, opts?: SessionDeleteOptions): Promise<void> {
+    return this.deps.metadata.delete(sessionId, opts);
   }
 
   async discardCreatedSession(sessionId: string): Promise<void> {

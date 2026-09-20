@@ -1093,6 +1093,10 @@ async function initializeRuntimeTurnSystem(
       input.product.executor.reportFailure,
       "runtime_recovery_failed",
     ),
+    onSessionDeletionReleaseFailure: createQueueWakeFailureReporter(
+      input.product.executor.reportFailure,
+      "session_deletion_release_failed",
+    ),
     nowMs: input.nowMs,
   });
 }

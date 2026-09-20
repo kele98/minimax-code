@@ -12,7 +12,8 @@ export type SessionFailureReason =
   | 'session-id-conflict'
   | 'run-location-invalid'
   | 'memory-recall-locked'
-  | 'task-agent-capture-unavailable';
+  | 'task-agent-capture-unavailable'
+  | 'session-not-archived';
 
 export class SessionServiceError extends Error {
   constructor(
