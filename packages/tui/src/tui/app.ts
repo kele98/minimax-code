@@ -358,6 +358,9 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     keybindings: options.keybindings,
     isStopped: () => stopped,
   });
+  // Turns whose prompt was already returned to the composer by the abort
+  // restore; keys are runtime turn ids, unique for the app's lifetime.
+  const restoredAbortTurnIds = new Set<string>();
   abortLiveTurn = createTuiAbortLiveTurn({
     controller,
     runProjection,
@@ -382,6 +385,11 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
       const cells = transcript.snapshot().filter((cell) => cell.turnId === turnId);
       const userCell = transcript.get(`user:${turnId}`);
       if (!userCell) return; // runtime-owned or retry-continuation turns
+      // A second Esc in the settle window can reach the runtime-owned branch
+      // with the same turnId; track restored turns so a repeat concatenates
+      // nothing. (Cell status cannot key this: abort-time markTurn also
+      // cancels still-pending user cells before the first restore.)
+      if (restoredAbortTurnIds.has(turnId)) return;
       const hasIrreversibleActivity = cells.some((cell) => {
         if (cell.id === `user:${turnId}`) return false;
         if (cell.kind === 'thinking' || cell.kind === 'turn-duration') return false;
@@ -394,7 +402,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
       });
       if (hasIrreversibleActivity) return;
       const text = userCell.content;
-      const attachments = (userCell.attachments ?? []).flatMap((attachment) =>
+      const draftAttachments = (userCell.attachments ?? []).flatMap((attachment) =>
         attachment.filePath && typeof attachment.sizeBytes === 'number'
           ? [
               {
@@ -407,12 +415,31 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
             ]
           : [],
       );
-      if (!text.trim() && attachments.length === 0) return;
+      // Asset-backed attachments have no filePath on the transcript cell; carry
+      // their assetId through the transport attachments so a resubmit still
+      // references the asset (the composer shows no chip for these).
+      const transportAttachments = (userCell.attachments ?? []).flatMap((attachment) =>
+        attachment.assetId
+          ? [
+              {
+                type: attachment.type,
+                fileName: attachment.fileName,
+                mimeType: attachment.mimeType,
+                ...(attachment.filePath ? { filePath: attachment.filePath } : {}),
+                assetId: attachment.assetId,
+              },
+            ]
+          : [],
+      );
+      if (!text.trim() && draftAttachments.length === 0 && transportAttachments.length === 0) {
+        return;
+      }
       commandFlow.restoreSubmission({
         submissionId: `abort-restore:${turnId}`,
         sessionId: controller.snapshot().session?.sessionId,
         content: text,
-        attachments,
+        attachments: draftAttachments,
+        ...(transportAttachments.length > 0 ? { transportAttachments } : {}),
         createdAtMs: Date.now(),
         editor: {
           schemaVersion: 1,
@@ -422,11 +449,29 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
           pasteCounter: 0,
         },
       });
-      for (const cell of cells) transcript.remove(cell.id);
+      restoredAbortTurnIds.add(turnId);
+      // Keep the transcript row but mark it cancelled so the aborted prompt is
+      // still visible in history; markTurn does not rewrite the user cell once
+      // the runtime echo flipped it to 'succeeded', so upsert explicitly.
+      transcript.upsert({
+        id: `user:${turnId}`,
+        kind: 'user',
+        status: 'cancelled',
+        content: userCell.content,
+        // createdAtMs is force-preserved by the store's merge for existing
+        // cells, so it is intentionally omitted here.
+        updatedAtMs: Date.now(),
+        ...(userCell.attachments ? { attachments: userCell.attachments } : {}),
+      });
       // The restored text already carries the submission's content; a pending
       // retry for it would merge the same text again on the next hydrate.
       draftLifecycle?.discardPendingRetries();
       chromeFlow?.setHint('Stopped · message restored to the Composer.');
+      // The funnel's updateChrome tail ran during the settle wait, before this
+      // hint was set; push the chrome once more so the hint is not left
+      // unpresented.
+      updateChrome(controller.snapshot());
+      tui.requestRender();
     },
   });
   const planModeFlow = new TuiPlanModeFlow({

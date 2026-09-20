@@ -3,6 +3,7 @@ import { isTuiDelegatedSession } from '../../../runtime/delegation.js';
 import type { TuiRunProjection } from '../../state/run-projection.js';
 import type { TuiChatController } from '../chat-controller.js';
 import { formatTuiActionFailure } from '../../../user-facing-failure.js';
+import { DEFAULT_CANCELLATION_SETTLEMENT_TIMEOUT_MS } from '../../../application/run-coordinator.js';
 
 export function createTuiAbortLiveTurn(options: {
   controller: TuiChatController;
@@ -16,10 +17,12 @@ export function createTuiAbortLiveTurn(options: {
   requestRender(): void;
   append(message: string, kind: 'warning' | 'error'): void;
   /**
-   * Invoked exactly once after a confirmed stop of the aborted turn, so the
-   * caller can return that turn's prompt to the composer when the turn
-   * produced no user-visible output. Only a confirmed root-turn stop fires
-   * this; a delegated-only stop may leave the root turn running.
+   * Invoked at most once per abort attempt after a confirmed stop of the
+   * aborted turn, so the caller can return that turn's prompt to the
+   * composer when the turn produced no user-visible output. Only a confirmed
+   * root-turn stop fires this; a delegated-only stop may leave the root turn
+   * running. A second abort attempt for the same turn may fire it again —
+   * the caller owns cross-attempt dedupe.
    */
   onLiveTurnAborted?: (info: { turnId: string; sessionId?: string }) => void;
 }): () => Promise<boolean> {
@@ -69,22 +72,33 @@ export function createTuiAbortLiveTurn(options: {
         options.updateChrome();
         options.requestRender();
       }
+      // Restore only after the run is CONFIRMED settled, not merely accepted:
+      // coordinator.abort() can return true after the settlement timeout while
+      // the run still drains, and a late stream event would defeat the gate.
+      // Bounded wait: if retirement does not settle within the cancellation
+      // settlement window, skip the restore entirely (an unbounded await
+      // would hang the funnel — nothing resolves idle waiters in that state).
+      // An unconfirmed stop skips the wait: no restore can fire, so the
+      // funnel (and leaveUi behind it) should not pay the bound.
+      let settleTimer: ReturnType<typeof setTimeout> | undefined;
+      const settledInTime = abortedRoot
+        ? await Promise.race([
+            options.controller.whenIdle().then(() => true),
+            new Promise<false>((resolve) => {
+              settleTimer = setTimeout(
+                () => resolve(false),
+                DEFAULT_CANCELLATION_SETTLEMENT_TIMEOUT_MS,
+              );
+            }),
+          ])
+        : false;
+      // Match the settleWithin house pattern: never leave the losing timer
+      // holding the event loop (embedded hosts drain on exit).
+      if (settleTimer !== undefined) clearTimeout(settleTimer);
       // Fire after the finally block: it clears the transient hint and would
       // otherwise erase the restore hint set by the callback.
-      if (abortedRoot && options.onLiveTurnAborted) {
-        try {
-          options.onLiveTurnAborted({ turnId, sessionId: session?.sessionId });
-        } catch (error) {
-          // Esc handling must survive a restore failure; report it instead.
-          options.append(
-            formatTuiActionFailure(error, {
-              summary: "Couldn't return the aborted prompt to the composer.",
-              nextStep: 'Retry Esc, or recall the prompt with Up.',
-              preservation: 'The session transcript is unchanged.',
-            }),
-            'warning',
-          );
-        }
+      if (abortedRoot && settledInTime && options.onLiveTurnAborted) {
+        fireRestore(options, { turnId, sessionId: session?.sessionId });
       }
       return delegatedStopped || abortedRoot;
     }
@@ -122,19 +136,7 @@ export function createTuiAbortLiveTurn(options: {
       // settle on the terminal runtime event, which can trail the abort
       // response, and late cells would otherwise defeat the gate.
       if (rootStopped && settled && options.onLiveTurnAborted) {
-        try {
-          options.onLiveTurnAborted({ turnId: runtimeTurnId, sessionId });
-        } catch (error) {
-          // Esc handling must survive a restore failure; report it instead.
-          options.append(
-            formatTuiActionFailure(error, {
-              summary: "Couldn't return the aborted prompt to the composer.",
-              nextStep: 'Retry Esc, or recall the prompt with Up.',
-              preservation: 'The session transcript is unchanged.',
-            }),
-            'warning',
-          );
-        }
+        fireRestore(options, { turnId: runtimeTurnId, sessionId });
       }
       return rootStopped || delegatedStopped;
     } catch (error) {
@@ -153,4 +155,31 @@ export function createTuiAbortLiveTurn(options: {
       return false;
     }
   };
+}
+
+/**
+ * Fires the restore callback with Esc-handling isolation: a restore failure
+ * is reported as a warning instead of escaping the funnel.
+ */
+function fireRestore(
+  options: {
+    onLiveTurnAborted?: (info: { turnId: string; sessionId?: string }) => void;
+    append: (message: string, kind: 'warning' | 'error') => void;
+  },
+  info: { turnId: string; sessionId?: string },
+): void {
+  if (!options.onLiveTurnAborted) return;
+  try {
+    options.onLiveTurnAborted(info);
+  } catch (error) {
+    // Esc handling must survive a restore failure; report it instead.
+    options.append(
+      formatTuiActionFailure(error, {
+        summary: "Couldn't return the aborted prompt to the composer.",
+        nextStep: 'Retry Esc, or recall the prompt with Up.',
+        preservation: 'The session transcript is unchanged.',
+      }),
+      'warning',
+    );
+  }
 }

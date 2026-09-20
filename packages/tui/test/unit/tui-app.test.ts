@@ -11173,12 +11173,15 @@ describe("createTuiApp", () => {
     app.start();
     await app.ready;
     const submitting = app.submit("Wait for the session");
-    await vi.waitFor(() =>
-      expect(app.controller.snapshot()).toMatchObject({
+    let turnIdAtAbort: string | undefined;
+    await vi.waitFor(() => {
+      const snapshot = app.controller.snapshot();
+      turnIdAtAbort = snapshot.activeTurnId;
+      expect(snapshot).toMatchObject({
         status: "starting",
         activeTurnId: expect.any(String),
-      }),
-    );
+      });
+    });
     expect(app.tui.render(80).join("\n")).toContain("Loading");
     expect(app.tui.render(80).join("\n")).not.toContain("Loading · 0s");
     expect(app.tui.render(80).join("\n")).not.toContain("MCode ·");
@@ -11193,14 +11196,15 @@ describe("createTuiApp", () => {
     await submitting;
 
     expect(runtime.sendMessage).not.toHaveBeenCalled();
-    // The turn had produced no output, so its prompt returned to the composer
-    // and the cancelled turn's transcript cells were removed.
+    // The turn had produced no output, so its prompt returned to the composer;
+    // the user row stays in the transcript, marked cancelled.
     expect(app.editor.getText()).toBe("Wait for the session");
+    expect(app.transcript.get(`user:${turnIdAtAbort}`)?.status).toBe("cancelled");
     expect(
       app.transcript
         .snapshot()
         .some((cell) => cell.kind === "assistant" && cell.status === "cancelled"),
-    ).toBe(false);
+    ).toBe(true);
     await app.stop();
   });
 
@@ -11276,12 +11280,12 @@ describe("createTuiApp", () => {
     );
     expect(runtime.sendMessage).toHaveBeenCalledTimes(2);
     expect(runtime.enqueueMessage).not.toHaveBeenCalled();
-    // Restoring the aborted prompt also removed that turn's transcript cells.
+    // Restoring the aborted prompt keeps that turn's rows, marked cancelled.
     expect(
       app.transcript
         .snapshot()
         .some((cell) => cell.kind === "assistant" && cell.status === "cancelled"),
-    ).toBe(false);
+    ).toBe(true);
     await app.stop();
   });
 
@@ -11384,12 +11388,21 @@ describe("createTuiApp", () => {
     terminal.input?.("\x1b");
     await vi.waitFor(() => expect(app.editor.getText()).toBe("Fix the typo"));
 
-    expect(app.transcript.get(`user:${turnId}`)).toBeUndefined();
+    // The user row stays in the transcript, marked cancelled and rendered
+    // with the muted marker.
+    const cancelledUserCell = app.transcript.get(`user:${turnId}`);
+    expect(cancelledUserCell).toBeDefined();
+    expect(cancelledUserCell?.status).toBe("cancelled");
     expect(
       app.transcript.snapshot().some((cell) => cell.turnId === turnId),
-    ).toBe(false);
-    expect(app.tui.render(160).join("\n")).toContain(
-      "Stopped · message restored to the Composer.",
+    ).toBe(true);
+    await vi.waitFor(() =>
+      expect(app.tui.render(160).join("\n")).toContain("× Cancelled"),
+    );
+    await vi.waitFor(() =>
+      expect(app.tui.render(160).join("\n")).toContain(
+        "Stopped · message restored to the Composer.",
+      ),
     );
     await app.stop();
   });
@@ -11432,7 +11445,7 @@ describe("createTuiApp", () => {
     await vi.waitFor(() => expect(app.editor.getText()).toBe("Wrong question"));
     expect(
       app.transcript.snapshot().some((cell) => cell.turnId === turnId),
-    ).toBe(false);
+    ).toBe(true);
     await app.stop();
   });
 
@@ -11520,6 +11533,9 @@ describe("createTuiApp", () => {
     await vi.waitFor(() =>
       expect(app.controller.snapshot().cancelling).toBe(true),
     );
+    // Let the abort funnel (settle race included) finish before asserting; an
+    // immediate assert could pass before a regressed restore ever fired.
+    await new Promise((resolve) => setTimeout(resolve, 150));
 
     expect(app.editor.getText()).toBe("");
     expect(app.transcript.get(`user:${turnId}`)).toBeDefined();
@@ -11569,6 +11585,56 @@ describe("createTuiApp", () => {
 
     expect(app.editor.getText()).toBe("");
     expect(app.transcript.get(`user:${turnId}`)).toBeDefined();
+    await app.stop();
+  });
+
+  it("does not restore when retirement does not settle within the settlement window", async () => {
+    const terminal = new FakeTerminal();
+    const runtime = createRuntime();
+    vi.mocked(runtime.sendMessage).mockImplementation(
+      async function* sendMessage(_req: SendMessageReq, signal?: AbortSignal) {
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener("abort", resolve, { once: true });
+        });
+        yield { type: "done" };
+      },
+    );
+    vi.mocked(runtime.abortSession).mockResolvedValue(true);
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    terminal.input?.("Hanging retirement");
+    terminal.input?.("\r");
+    await vi.waitFor(() =>
+      expect(app.controller.snapshot().status).toBe("running"),
+    );
+    const turnId = app.controller.snapshot().activeTurnId;
+
+    // Simulate a retirement that never settles: whenIdle parks its waiter
+    // forever, so the bounded settle race must skip the restore instead of
+    // hanging the funnel.
+    vi.spyOn(app.controller, "whenIdle").mockReturnValue(new Promise(() => undefined));
+
+    terminal.input?.("\x1b");
+    // Both the coordinator settle wait and the restore's settle race use the
+    // 1s cancellation-settlement window; dwell past both before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+
+    expect(app.editor.getText()).toBe("");
+    expect(app.tui.render(160).join("\n")).not.toContain(
+      "Stopped · message restored to the Composer.",
+    );
+    // The restore never fired; the user row is untouched by it. (Its status
+    // may legitimately read 'cancelled' from abort-time markTurn when Esc
+    // lands before the user echo, which is unrelated to the restore.)
+    expect(app.transcript.get(`user:${turnId}`)).toBeDefined();
+
     await app.stop();
   });
 
