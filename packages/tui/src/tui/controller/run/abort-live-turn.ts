@@ -15,6 +15,13 @@ export function createTuiAbortLiveTurn(options: {
   updateChrome(): void;
   requestRender(): void;
   append(message: string, kind: 'warning' | 'error'): void;
+  /**
+   * Invoked exactly once after a confirmed stop of the aborted turn, so the
+   * caller can return that turn's prompt to the composer when the turn
+   * produced no user-visible output. Only a confirmed root-turn stop fires
+   * this; a delegated-only stop may leave the root turn running.
+   */
+  onLiveTurnAborted?: (info: { turnId: string; sessionId?: string }) => void;
 }): () => Promise<boolean> {
   return async () => {
     const snapshot = options.controller.snapshot();
@@ -47,19 +54,39 @@ export function createTuiAbortLiveTurn(options: {
       return receipt.rootStopped || receipt.stoppedSessionIds.length > 0;
     };
     if (snapshot.activeTurnId) {
+      const turnId = snapshot.activeTurnId;
+      let abortedRoot = false;
+      let delegatedStopped = false;
       try {
         const stoppingDelegation = stopDelegatedAgents();
-        const aborted = await options.controller.abort();
-        const delegatedStopped = await stoppingDelegation;
-        if (!aborted && !delegatedStopped) {
+        abortedRoot = await options.controller.abort();
+        delegatedStopped = await stoppingDelegation;
+        if (!abortedRoot && !delegatedStopped) {
           options.append('Runtime did not confirm that the active response stopped.', 'warning');
         }
-        return delegatedStopped || aborted;
       } finally {
         options.setTransientHint(undefined);
         options.updateChrome();
         options.requestRender();
       }
+      // Fire after the finally block: it clears the transient hint and would
+      // otherwise erase the restore hint set by the callback.
+      if (abortedRoot && options.onLiveTurnAborted) {
+        try {
+          options.onLiveTurnAborted({ turnId, sessionId: session?.sessionId });
+        } catch (error) {
+          // Esc handling must survive a restore failure; report it instead.
+          options.append(
+            formatTuiActionFailure(error, {
+              summary: "Couldn't return the aborted prompt to the composer.",
+              nextStep: 'Retry Esc, or recall the prompt with Up.',
+              preservation: 'The session transcript is unchanged.',
+            }),
+            'warning',
+          );
+        }
+      }
+      return delegatedStopped || abortedRoot;
     }
     const runtimeTurnId = options.latestRuntimeTurnId();
     if (!runtimeTurnId || !snapshot.session?.sessionId) return false;
@@ -80,17 +107,35 @@ export function createTuiAbortLiveTurn(options: {
         options.append('Runtime did not confirm that the active response stopped.', 'warning');
       }
       const active = await options.getActiveRun(sessionId).catch(() => undefined);
-      if (
-        active &&
+      const settled =
+        !!active &&
         (active.state === 'idle' ||
           active.state === 'terminal' ||
-          (active.turnId && active.turnId !== runtimeTurnId))
-      ) {
+          (active.turnId && active.turnId !== runtimeTurnId));
+      if (settled) {
         options.runProjection.clearRuntimeTurn(runtimeTurnId);
         options.setTransientHint(undefined);
       }
       options.updateChrome();
       options.requestRender();
+      // Restore only once the run is confirmed settled: runtime-owned turns
+      // settle on the terminal runtime event, which can trail the abort
+      // response, and late cells would otherwise defeat the gate.
+      if (rootStopped && settled && options.onLiveTurnAborted) {
+        try {
+          options.onLiveTurnAborted({ turnId: runtimeTurnId, sessionId });
+        } catch (error) {
+          // Esc handling must survive a restore failure; report it instead.
+          options.append(
+            formatTuiActionFailure(error, {
+              summary: "Couldn't return the aborted prompt to the composer.",
+              nextStep: 'Retry Esc, or recall the prompt with Up.',
+              preservation: 'The session transcript is unchanged.',
+            }),
+            'warning',
+          );
+        }
+      }
       return rootStopped || delegatedStopped;
     } catch (error) {
       options.runProjection.clearRuntimeTurnStopping(runtimeTurnId);

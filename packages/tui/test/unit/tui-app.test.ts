@@ -11193,11 +11193,14 @@ describe("createTuiApp", () => {
     await submitting;
 
     expect(runtime.sendMessage).not.toHaveBeenCalled();
-    expect(app.transcript.snapshot()).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ kind: "assistant", status: "cancelled" }),
-      ]),
-    );
+    // The turn had produced no output, so its prompt returned to the composer
+    // and the cancelled turn's transcript cells were removed.
+    expect(app.editor.getText()).toBe("Wait for the session");
+    expect(
+      app.transcript
+        .snapshot()
+        .some((cell) => cell.kind === "assistant" && cell.status === "cancelled"),
+    ).toBe(false);
     await app.stop();
   });
 
@@ -11247,7 +11250,9 @@ describe("createTuiApp", () => {
     );
     terminal.input?.("Second request");
     terminal.input?.("\r");
-    await vi.waitFor(() => expect(app.editor.getText()).toBe("Second request"));
+    await vi.waitFor(() =>
+      expect(app.editor.getText()).toContain("Second request"),
+    );
     expect(runtime.sendMessage).toHaveBeenCalledTimes(1);
 
     await vi.waitFor(() =>
@@ -11257,6 +11262,11 @@ describe("createTuiApp", () => {
       expect(app.controller.snapshot().retiringTurnId).toBeUndefined(),
     );
     expect(app.controller.snapshot().cancelling).toBe(false);
+    // The aborted first prompt (still without output) returns to the composer
+    // and merges with the text typed while the fence was active.
+    await vi.waitFor(() =>
+      expect(app.editor.getText()).toBe("First request\nSecond request"),
+    );
     expect(app.tui.render(80).join("\n")).not.toContain(
       "Stopping the current response",
     );
@@ -11266,11 +11276,12 @@ describe("createTuiApp", () => {
     );
     expect(runtime.sendMessage).toHaveBeenCalledTimes(2);
     expect(runtime.enqueueMessage).not.toHaveBeenCalled();
-    expect(app.transcript.snapshot()).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ kind: "assistant", status: "cancelled" }),
-      ]),
-    );
+    // Restoring the aborted prompt also removed that turn's transcript cells.
+    expect(
+      app.transcript
+        .snapshot()
+        .some((cell) => cell.kind === "assistant" && cell.status === "cancelled"),
+    ).toBe(false);
     await app.stop();
   });
 
@@ -11283,6 +11294,9 @@ describe("createTuiApp", () => {
     });
     vi.mocked(runtime.sendMessage).mockImplementation(
       async function* sendMessage(_req: SendMessageReq, signal?: AbortSignal) {
+        // One delta keeps this turn outside the abort-prompt-restore window so
+        // this test stays focused on the failed-submission restore below.
+        yield { type: "delta", content: "First response" };
         await new Promise<void>((resolve) => {
           signal?.addEventListener("abort", resolve, { once: true });
         });
@@ -11336,6 +11350,276 @@ describe("createTuiApp", () => {
       "Runtime is still stopping; your draft is preserved",
     );
     await app.stop();
+  });
+
+  it("returns the prompt to the composer when a turn is aborted before any output", async () => {
+    const terminal = new FakeTerminal();
+    const runtime = createRuntime();
+    vi.mocked(runtime.sendMessage).mockImplementation(
+      async function* sendMessage(_req: SendMessageReq, signal?: AbortSignal) {
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener("abort", resolve, { once: true });
+        });
+        yield { type: "done" };
+      },
+    );
+    vi.mocked(runtime.abortSession).mockResolvedValue(true);
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    terminal.input?.("Fix the typo");
+    terminal.input?.("\r");
+    await vi.waitFor(() =>
+      expect(app.controller.snapshot().status).toBe("running"),
+    );
+    const turnId = app.controller.snapshot().activeTurnId;
+    expect(turnId).toBeTruthy();
+
+    terminal.input?.("\x1b");
+    await vi.waitFor(() => expect(app.editor.getText()).toBe("Fix the typo"));
+
+    expect(app.transcript.get(`user:${turnId}`)).toBeUndefined();
+    expect(
+      app.transcript.snapshot().some((cell) => cell.turnId === turnId),
+    ).toBe(false);
+    expect(app.tui.render(160).join("\n")).toContain(
+      "Stopped · message restored to the Composer.",
+    );
+    await app.stop();
+  });
+
+  it("returns a thinking-only turn's prompt to the composer on abort", async () => {
+    const terminal = new FakeTerminal();
+    const runtime = createRuntime();
+    vi.mocked(runtime.sendMessage).mockImplementation(
+      async function* sendMessage(_req: SendMessageReq, signal?: AbortSignal) {
+        yield { type: "delta", thinking: "let me consider" };
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener("abort", resolve, { once: true });
+        });
+        yield { type: "done" };
+      },
+    );
+    vi.mocked(runtime.abortSession).mockResolvedValue(true);
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    terminal.input?.("Wrong question");
+    terminal.input?.("\r");
+    await vi.waitFor(() =>
+      expect(app.controller.snapshot().status).toBe("running"),
+    );
+    const turnId = app.controller.snapshot().activeTurnId;
+    await vi.waitFor(() =>
+      expect(
+        app.transcript.snapshot().some((cell) => cell.kind === "thinking"),
+      ).toBe(true),
+    );
+
+    terminal.input?.("\x1b");
+    await vi.waitFor(() => expect(app.editor.getText()).toBe("Wrong question"));
+    expect(
+      app.transcript.snapshot().some((cell) => cell.turnId === turnId),
+    ).toBe(false);
+    await app.stop();
+  });
+
+  it("keeps the transcript and leaves the composer empty when aborting after output", async () => {
+    const terminal = new FakeTerminal();
+    const runtime = createRuntime();
+    vi.mocked(runtime.sendMessage).mockImplementation(
+      async function* sendMessage(_req: SendMessageReq, signal?: AbortSignal) {
+        yield { type: "delta", content: "partial answer" };
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener("abort", resolve, { once: true });
+        });
+        yield { type: "done" };
+      },
+    );
+    vi.mocked(runtime.abortSession).mockResolvedValue(true);
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    terminal.input?.("Keep this prompt");
+    terminal.input?.("\r");
+    await vi.waitFor(() =>
+      expect(app.controller.snapshot().status).toBe("running"),
+    );
+    const turnId = app.controller.snapshot().activeTurnId;
+    await vi.waitFor(() =>
+      expect(
+        app.transcript.snapshot().some(
+          (cell) => cell.kind === "assistant" && cell.content.length > 0,
+        ),
+      ).toBe(true),
+    );
+
+    terminal.input?.("\x1b");
+    await vi.waitFor(() =>
+      expect(app.controller.snapshot().activeTurnId).toBeUndefined(),
+    );
+    await vi.waitFor(() =>
+      expect(app.controller.snapshot().retiringTurnId).toBeUndefined(),
+    );
+
+    expect(app.editor.getText()).toBe("");
+    expect(app.transcript.get(`user:${turnId}`)).toBeDefined();
+    expect(app.tui.render(160).join("\n")).not.toContain(
+      "Stopped · message restored to the Composer.",
+    );
+    await app.stop();
+  });
+
+  it("does not restore the prompt when the runtime does not confirm the stop", async () => {
+    const terminal = new FakeTerminal();
+    const runtime = createRuntime();
+    vi.mocked(runtime.sendMessage).mockImplementation(
+      async function* sendMessage(_req: SendMessageReq, signal?: AbortSignal) {
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener("abort", resolve, { once: true });
+        });
+        yield { type: "done" };
+      },
+    );
+    vi.mocked(runtime.abortSession).mockResolvedValue(false);
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    terminal.input?.("Unconfirmed stop");
+    terminal.input?.("\r");
+    await vi.waitFor(() =>
+      expect(app.controller.snapshot().status).toBe("running"),
+    );
+    const turnId = app.controller.snapshot().activeTurnId;
+
+    terminal.input?.("\x1b");
+    await vi.waitFor(() =>
+      expect(app.controller.snapshot().cancelling).toBe(true),
+    );
+
+    expect(app.editor.getText()).toBe("");
+    expect(app.transcript.get(`user:${turnId}`)).toBeDefined();
+    await app.stop();
+  });
+
+  it("does not restore the prompt when only delegated agents stopped", async () => {
+    const terminal = new FakeTerminal();
+    const runtime = createRuntime();
+    vi.mocked(runtime.sendMessage).mockImplementation(
+      async function* sendMessage(_req: SendMessageReq, signal?: AbortSignal) {
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener("abort", resolve, { once: true });
+        });
+        yield { type: "done" };
+      },
+    );
+    vi.mocked(runtime.abortSession).mockResolvedValue(false);
+    vi.mocked(runtime.stopDelegation).mockResolvedValue({
+      rootStopped: false,
+      stoppedSessionIds: ["child-1"],
+      failedSessionIds: [],
+      activeSessionIds: [],
+    });
+    const app = createTuiApp({
+      runtime,
+      terminal,
+      version: "0.1.0",
+      workspaceDir: "/workspace",
+    });
+
+    app.start();
+    await app.ready;
+    terminal.input?.("Root keeps running");
+    terminal.input?.("\r");
+    await vi.waitFor(() =>
+      expect(app.controller.snapshot().status).toBe("running"),
+    );
+    const turnId = app.controller.snapshot().activeTurnId;
+
+    terminal.input?.("\x1b");
+    await vi.waitFor(() =>
+      expect(app.controller.snapshot().cancelling).toBe(true),
+    );
+    // Let the abort funnel settle; the root turn was never confirmed stopped.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(app.editor.getText()).toBe("");
+    expect(app.transcript.get(`user:${turnId}`)).toBeDefined();
+    await app.stop();
+  });
+
+  it("does not duplicate the restored prompt after relaunch", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "mcode-abort-draft-"));
+    try {
+      const terminal = new FakeTerminal();
+      const runtime = createRuntime();
+      vi.mocked(runtime.sendMessage).mockImplementation(
+        async function* sendMessage(_req: SendMessageReq, signal?: AbortSignal) {
+          await new Promise<void>((resolve) => {
+            signal?.addEventListener("abort", resolve, { once: true });
+          });
+          yield { type: "done" };
+        },
+      );
+      vi.mocked(runtime.abortSession).mockResolvedValue(true);
+      const first = createTuiApp({
+        runtime,
+        terminal,
+        version: "0.1.0",
+        dataDir,
+        workspaceDir: "/workspace",
+      });
+      first.start();
+      await first.ready;
+      await first.openSession("session-1");
+      terminal.input?.("Only once");
+      terminal.input?.("\r");
+      await vi.waitFor(() =>
+        expect(first.controller.snapshot().status).toBe("running"),
+      );
+      terminal.input?.("\x1b");
+      await vi.waitFor(() => expect(first.editor.getText()).toBe("Only once"));
+      await first.stop();
+
+      const restored = createTuiApp({
+        runtime: createRuntime(),
+        terminal: new FakeTerminal(),
+        version: "0.1.0",
+        dataDir,
+        workspaceDir: "/workspace",
+      });
+      restored.start();
+      await restored.ready;
+      await restored.openSession("session-1");
+      await vi.waitFor(() => expect(restored.editor.getText()).toBe("Only once"));
+      await restored.stop();
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
   });
 
   it("aborts session creation when the TUI stops during its first turn", async () => {

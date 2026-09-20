@@ -371,6 +371,63 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
       if (!stopped) tui.requestRender();
     },
     append: appendLocalCell,
+    onLiveTurnAborted: ({ turnId }) => {
+      // Return the aborted prompt to the composer only when the turn produced
+      // no user-visible output: any assistant text, tool call, or steer
+      // message means the user was interacting with a live response, not
+      // regretting a fresh submission. Thinking is internal model process and
+      // does not disqualify: it is the most common regret moment, and nothing
+      // of value is discarded by resending.
+      if (sessionFlow.isSideModeActive()) return;
+      const cells = transcript.snapshot().filter((cell) => cell.turnId === turnId);
+      const userCell = transcript.get(`user:${turnId}`);
+      if (!userCell) return; // runtime-owned or retry-continuation turns
+      const hasIrreversibleActivity = cells.some((cell) => {
+        if (cell.id === `user:${turnId}`) return false;
+        if (cell.kind === 'thinking' || cell.kind === 'turn-duration') return false;
+        // markTurn('cancelled') synthesizes an empty assistant placeholder for
+        // turns with no assistant output before this callback can run.
+        if ((cell.kind === 'assistant' || cell.kind === 'assistant-preamble') && !cell.content) {
+          return false;
+        }
+        return true;
+      });
+      if (hasIrreversibleActivity) return;
+      const text = userCell.content;
+      const attachments = (userCell.attachments ?? []).flatMap((attachment) =>
+        attachment.filePath && typeof attachment.sizeBytes === 'number'
+          ? [
+              {
+                type: attachment.type,
+                fileName: attachment.fileName,
+                mimeType: attachment.mimeType,
+                sizeBytes: attachment.sizeBytes,
+                filePath: attachment.filePath,
+              },
+            ]
+          : [],
+      );
+      if (!text.trim() && attachments.length === 0) return;
+      commandFlow.restoreSubmission({
+        submissionId: `abort-restore:${turnId}`,
+        sessionId: controller.snapshot().session?.sessionId,
+        content: text,
+        attachments,
+        createdAtMs: Date.now(),
+        editor: {
+          schemaVersion: 1,
+          text,
+          cursor: text.length,
+          pastes: [],
+          pasteCounter: 0,
+        },
+      });
+      for (const cell of cells) transcript.remove(cell.id);
+      // The restored text already carries the submission's content; a pending
+      // retry for it would merge the same text again on the next hydrate.
+      draftLifecycle?.discardPendingRetries();
+      chromeFlow?.setHint('Stopped · message restored to the Composer.');
+    },
   });
   const planModeFlow = new TuiPlanModeFlow({
     currentSession: () => controller.snapshot().session,
