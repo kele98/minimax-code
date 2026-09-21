@@ -11501,6 +11501,105 @@ describe("createTuiApp", () => {
     await app.stop();
   });
 
+  it("restores a mixed file-backed and asset-backed submission completely on abort", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcode-mixed-abort-"));
+    try {
+      const localPath = join(directory, "local.png");
+      await writeFile(localPath, "png");
+      const terminal = new FakeTerminal();
+      const runtime = createRuntime();
+      vi.mocked(runtime.sendMessage).mockImplementation(
+        async function* sendMessage(_req: SendMessageReq, signal?: AbortSignal) {
+          await new Promise<void>((resolve) => {
+            signal?.addEventListener("abort", resolve, { once: true });
+          });
+          yield { type: "done" };
+        },
+      );
+      vi.mocked(runtime.abortSession).mockResolvedValue(true);
+      const app = createTuiApp({
+        runtime,
+        terminal,
+        version: "0.1.0",
+        workspaceDir: "/workspace",
+      });
+
+      app.start();
+      await app.ready;
+      // Mixed submission: a file-backed attachment (composer chip) plus an
+      // asset-only transport attachment. Submit through the seed path so the
+      // snapshot carries the full transport list, exactly as a paste flow
+      // would produce.
+      const seed = {
+        editor: {
+          schemaVersion: 1 as const,
+          text: "Mixed restore",
+          cursor: 13,
+          pastes: [],
+          pasteCounter: 0,
+        },
+        resources: {
+          attachments: [
+            {
+              type: "image" as const,
+              fileName: "local.png",
+              mimeType: "image/png",
+              sizeBytes: 3,
+              filePath: localPath,
+            },
+          ],
+        },
+        transportAttachments: [
+          {
+            type: "image" as const,
+            fileName: "local.png",
+            mimeType: "image/png",
+            filePath: localPath,
+          },
+          {
+            type: "image" as const,
+            fileName: "asset.png",
+            mimeType: "image/png",
+            assetId: "asset-mixed-1",
+          },
+        ],
+      };
+      void app.commandFlow.submit("Mixed restore", seed).catch(() => undefined);
+      await vi.waitFor(() =>
+        expect(app.controller.snapshot().status).toBe("running"),
+      );
+      const turnIdAtAbort = app.controller.snapshot().activeTurnId;
+
+      terminal.input?.("\x1b");
+      await vi.waitFor(() =>
+        expect(app.editor.getText()).toBe("Mixed restore [Image #1] "),
+      );
+      // The retained snapshot was consulted and dropped after the restore.
+      await vi.waitFor(() =>
+        expect(app.commandFlow.getRetainedSubmission(String(turnIdAtAbort))).toBeUndefined(),
+      );
+
+      // Resubmit the restored draft unchanged.
+      app.editor.handleInput("\r");
+      await vi.waitFor(() =>
+        expect(vi.mocked(runtime.sendMessage).mock.calls.length).toBe(2),
+      );
+
+      const request = vi.mocked(runtime.sendMessage).mock.calls[1][0];
+      expect(request.attachments).toHaveLength(2);
+      const locals = request.attachments?.map((attachment) => attachment.local) ?? [];
+      expect(locals).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ filePath: localPath }),
+          expect.objectContaining({ assetId: "asset-mixed-1" }),
+        ]),
+      );
+      await app.stop();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("does not restore the prompt when the runtime does not confirm the stop", async () => {
     const terminal = new FakeTerminal();
     const runtime = createRuntime();

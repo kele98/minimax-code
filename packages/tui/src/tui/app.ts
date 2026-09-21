@@ -17,6 +17,10 @@ import { TranscriptView } from './transcript/view.js';
 import { TuiChatController, type TuiChatSnapshot } from './controller/chat-controller.js';
 import { TuiChromeFlow } from './controller/product/chrome-flow.js';
 import type { TuiDraftLifecycle } from './features/composer/draft-lifecycle.js';
+import { retainAvailableAttachmentPlaceholders } from './features/composer/draft-recovery.js';
+import type { TuiSubmissionSnapshot } from './features/composer/submission.js';
+import { statSync } from 'node:fs';
+import type { TuiTransportAttachment } from '../types/invocation.js';
 import { TuiRunProjection } from './state/run-projection.js';
 import { createTuiState, TuiEffectRunner, TuiStateStore } from './state/index.js';
 import { FeedbackFlow as Feedback } from './controller/product/feedback-flow.js';
@@ -401,6 +405,24 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
         return true;
       });
       if (hasIrreversibleActivity) return;
+      // Preferred path: replay the ORIGINAL submission retained for this turn
+      // (complete attachment set, transport content, client intent, editor
+      // state) instead of reconstructing a lossy copy from the display cell.
+      const retained = commandFlow.getRetainedSubmission(turnId);
+      const retainedFiltered = retained
+        ? filterRetainedSubmissionForRestore(retained)
+        : undefined;
+      if (retainedFiltered) {
+        commandFlow.restoreSubmission(retainedFiltered);
+        commandFlow.dropRetainedSubmission(turnId);
+        restoredAbortTurnIds.add(turnId);
+        markAbortedUserRowCancelled(transcript, turnId);
+        draftLifecycle?.discardPendingRetries();
+        chromeFlow?.setHint('Stopped · message restored to the Composer.');
+        updateChrome(controller.snapshot());
+        tui.requestRender();
+        return;
+      }
       const text = userCell.content;
       const draftAttachments = (userCell.attachments ?? []).flatMap((attachment) =>
         attachment.filePath && typeof attachment.sizeBytes === 'number'
@@ -415,21 +437,33 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
             ]
           : [],
       );
-      // Asset-backed attachments have no filePath on the transcript cell; carry
-      // their assetId through the transport attachments so a resubmit still
-      // references the asset (the composer shows no chip for these).
-      const transportAttachments = (userCell.attachments ?? []).flatMap((attachment) =>
-        attachment.assetId
-          ? [
-              {
-                type: attachment.type,
-                fileName: attachment.fileName,
-                mimeType: attachment.mimeType,
-                ...(attachment.filePath ? { filePath: attachment.filePath } : {}),
-                assetId: attachment.assetId,
-              },
-            ]
-          : [],
+      // Fallback path: reconstruct from the display cell. The transport list
+      // must carry BOTH halves of a mixed row (asset-backed AND file-backed
+      // entries): submission-time selection is `transportAttachments ??
+      // attachments`, so a partial transport list would silently drop the
+      // file-backed attachments on resubmit.
+      const transportAttachments: TuiTransportAttachment[] = (userCell.attachments ?? []).flatMap(
+        (attachment): TuiTransportAttachment[] =>
+          attachment.assetId
+            ? [
+                {
+                  type: attachment.type,
+                  fileName: attachment.fileName,
+                  mimeType: attachment.mimeType,
+                  ...(attachment.filePath ? { filePath: attachment.filePath } : {}),
+                  assetId: attachment.assetId,
+                },
+              ]
+            : attachment.filePath && typeof attachment.sizeBytes === 'number'
+              ? [
+                  {
+                    type: attachment.type,
+                    fileName: attachment.fileName,
+                    mimeType: attachment.mimeType,
+                    filePath: attachment.filePath,
+                  },
+                ]
+              : [],
       );
       if (!text.trim() && draftAttachments.length === 0 && transportAttachments.length === 0) {
         return;
@@ -450,19 +484,7 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
         },
       });
       restoredAbortTurnIds.add(turnId);
-      // Keep the transcript row but mark it cancelled so the aborted prompt is
-      // still visible in history; markTurn does not rewrite the user cell once
-      // the runtime echo flipped it to 'succeeded', so upsert explicitly.
-      transcript.upsert({
-        id: `user:${turnId}`,
-        kind: 'user',
-        status: 'cancelled',
-        content: userCell.content,
-        // createdAtMs is force-preserved by the store's merge for existing
-        // cells, so it is intentionally omitted here.
-        updatedAtMs: Date.now(),
-        ...(userCell.attachments ? { attachments: userCell.attachments } : {}),
-      });
+      markAbortedUserRowCancelled(transcript, turnId);
       // The restored text already carries the submission's content; a pending
       // retry for it would merge the same text again on the next hydrate.
       draftLifecycle?.discardPendingRetries();
@@ -548,8 +570,11 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
     },
     followBottom: () => layout.followBottom(),
     requestWelcomeRebuild: () => tui.requestImmediateRender(),
-    switchComposerDraft: (sessionKey) =>
-      draftLifecycle?.switchSession(sessionKey) ?? Promise.resolve(),
+    switchComposerDraft: (sessionKey) => {
+      // Retained turn submissions belong to the previous session's turns.
+      commandFlow.clearRetainedSubmissions();
+      return draftLifecycle?.switchSession(sessionKey) ?? Promise.resolve();
+    },
     detachForegroundObserver: () => runtimeEventFlow?.detachForegroundObserver(),
     adoptForegroundRun: () =>
       sessionLifecycle.adoptForegroundRun(
@@ -900,8 +925,70 @@ export function createTuiApp(options: CreateTuiAppOptions): TuiApp {
       updateChromeAndRequestRender();
     },
     submit: (input) => commandFlow.submit(input).then(() => undefined),
+    /** Exposed for integration tests that submit with an explicit seed. */
+    commandFlow,
     abortTurn: abortLiveTurn,
     leaveUi,
     stop,
   };
+}
+
+function fileExists(filePath: string): boolean {
+  try {
+    return statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Filters a retained submission snapshot for abort-time restore: drops
+ * attachments whose backing file disappeared (asset-backed entries stay),
+ * and prunes editor placeholders accordingly. Returns undefined when nothing
+ * restorable remains.
+ */
+function filterRetainedSubmissionForRestore(
+  snapshot: TuiSubmissionSnapshot,
+): TuiSubmissionSnapshot | undefined {
+  const attachments = snapshot.attachments.filter((attachment) =>
+    fileExists(attachment.filePath),
+  );
+  const transportAttachments = (snapshot.transportAttachments ?? []).filter((attachment) =>
+    attachment.assetId ? true : attachment.filePath ? fileExists(attachment.filePath) : false,
+  );
+  if (!snapshot.content.trim() && attachments.length === 0 && transportAttachments.length === 0) {
+    return undefined;
+  }
+  return {
+    ...snapshot,
+    submissionId: `abort-restore:${snapshot.submissionId}`,
+    attachments,
+    ...(snapshot.transportAttachments ? { transportAttachments } : {}),
+    editor: retainAvailableAttachmentPlaceholders(
+      // Some submission paths (automation results, test seeds) submit with a
+      // payload but an empty editor draft; restoring that verbatim would
+      // leave the composer blank, so fall back to the visible content.
+      snapshot.editor.text.trim() || snapshot.transportContent
+        ? snapshot.editor
+        : { ...snapshot.editor, text: snapshot.content, cursor: snapshot.content.length },
+      attachments,
+    ),
+  };
+}
+
+/** Marks the aborted turn's user row cancelled so it stays visible in history. */
+function markAbortedUserRowCancelled(transcript: TranscriptStore, turnId: string): void {
+  const userCell = transcript.get(`user:${turnId}`);
+  if (!userCell) return;
+  // markTurn does not rewrite the user cell once the runtime echo flipped it
+  // to 'succeeded', so upsert explicitly. createdAtMs is force-preserved by
+  // the store's merge for existing cells and is intentionally omitted.
+  transcript.upsert({
+    id: `user:${turnId}`,
+    kind: 'user',
+    status: 'cancelled',
+    ...(userCell.content ? { content: userCell.content } : {}),
+    updatedAtMs: Date.now(),
+    ...(userCell.attachments ? { attachments: userCell.attachments } : {}),
+  });
 }
