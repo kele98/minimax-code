@@ -233,7 +233,12 @@ export class TuiChatController {
         status: 'error',
         error: formatTuiActionFailure(error, {
           summary: "Couldn't open this session.",
-          nextStep: 'Retry.',
+          // The formatted string no longer carries the error key, so branch
+          // on the raw error: a deletion claim elsewhere is not retryable
+          // here and deserves its own next step.
+          nextStep: isSessionDeletionInFlight(error)
+            ? 'The session is being deleted in another window. It will disappear once deletion finishes.'
+            : 'Retry.',
           preservation: 'Its saved messages are unchanged.',
         }),
       });
@@ -910,4 +915,17 @@ export class TuiChatController {
     for (const resolve of this.idleWaiters) resolve();
     this.idleWaiters.clear();
   }
+}
+
+/**
+ * Detects a projection-time refusal caused by a deletion claim in another
+ * window (restoring an archived session lost the race). Keyed on the raw
+ * error because the formatted failure string no longer carries the key.
+ */
+function isSessionDeletionInFlight(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { key?: unknown }).key === 'SESSION_DELETING'
+  );
 }

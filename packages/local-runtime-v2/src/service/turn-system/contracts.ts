@@ -522,7 +522,11 @@ export interface TurnService {
   dispatchSessionQueue(sessionId: string): Promise<QueueSteerDispatchResult>;
   /** Internal Queue mutation/release wake used by compatibility composition. */
   dispatchQueue(sessionId: string): Promise<void>;
-  sessionDeletion(sessionId: string, cleanup: () => Promise<void>): Promise<void>;
+  sessionDeletion(
+    sessionId: string,
+    cleanup: () => Promise<void>,
+    opts?: { readonly expectedArchived?: boolean },
+  ): Promise<void>;
 }
 
 /** Queue execution seam implemented by the TurnSystem-owned message-delivery workflow. */

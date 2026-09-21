@@ -25,6 +25,7 @@ import {
   sessionAgentState,
   sessions,
 } from '../../../../infra/db/schema/sessions.js';
+import { sessionLocks } from '../../../../infra/db/schema/turn.js';
 import {
   assertSessionModelSnapshot,
   normalizeSessionModelUpdate,
@@ -1094,12 +1095,49 @@ function selectRow(db: AppDb, sessionId: string): SessionStorageRow | undefined 
 }
 
 function writeRow(db: AppDb, existing: SessionStorageRow, record: SessionRecord): void {
+  // A row whose archived flag transitions to false (restore, promoted root,
+  // implicit reactivation) must not commit while a deletion fence owns the
+  // session: the deletion claim is the durable adjudication and would
+  // otherwise destroy a session the user just brought back. The check shares
+  // the write transaction, so it serializes against the claim transaction on
+  // the same SQLite writer. Non-transitions skip it — turn settlement keeps
+  // writing status rows for an active session during an unconditional delete.
+  if (existing.archived === 1 && record.archived !== true) {
+    assertSessionNotUnderDeletion(db, record.sessionId);
+  }
   const row = encodeSessionRow(record, {
     preservedRecordJson: existing.recordJson,
     projectId: existing.projectId,
   });
   db.update(sessions).set(row).where(eq(sessions.sessionId, record.sessionId)).run();
   writeSessionSearchDocument(db, record);
+}
+
+/** Deletion owner kinds mirrored from the turn-system fence (see turn-lease-recovery.ts). */
+const SESSION_DELETION_LOCK_OWNER_KINDS = [
+  'session-deletion',
+  'turn-deleting',
+  'compaction-deleting',
+  'maintenance-deleting',
+] as const;
+
+function assertSessionNotUnderDeletion(db: AppDb, sessionId: string): void {
+  const claim = db
+    .select({ sessionId: sessionLocks.sessionId })
+    .from(sessionLocks)
+    .where(
+      and(
+        eq(sessionLocks.sessionId, sessionId),
+        inArray(sessionLocks.ownerKind, SESSION_DELETION_LOCK_OWNER_KINDS),
+      ),
+    )
+    .get();
+  if (claim) {
+    throw new SessionServiceError(
+      'session-deletion-in-progress',
+      'This session is currently being deleted. Restoring is unavailable until deletion finishes.',
+    );
+  }
 }
 
 function assertSessionDefinitionCreate(

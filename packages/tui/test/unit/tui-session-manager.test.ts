@@ -699,6 +699,31 @@ describe('TuiSessionManager', () => {
     expect(renderPlain(manager)).toContain('Archived investigation');
   });
 
+  it('keeps the archived row with a dedicated status when a deletion claim refuses the restore', async () => {
+    const onSetArchived = vi.fn(async () => {
+      throw Object.assign(
+        new Error(
+          'This session is currently being deleted. Restoring is unavailable until deletion finishes.',
+        ),
+        { status: 409, key: 'SESSION_DELETING' },
+      );
+    });
+    const { manager } = createManager({ onSetArchived });
+    manager.handleInput('\t');
+
+    manager.handleInput('\x04');
+    await vi.waitFor(() =>
+      expect(onSetArchived).toHaveBeenCalledWith('session-archived', false),
+    );
+    await flushActions();
+
+    expect(renderPlain(manager)).toContain('Session is being deleted in another window.');
+    // The row stays archived and the generic failure text is not shown.
+    expect(renderPlain(manager)).toContain('Archived investigation');
+    expect(renderPlain(manager)).not.toContain('Session changes were not saved');
+    expect(renderPlain(manager)).not.toContain('Session restored.');
+  });
+
   it('waits out an in-flight page load before deleting so the row cannot be re-added', async () => {
     let resolvePage:
       | ((page: { sessions: readonly TuiSession[]; hasMore: boolean }) => void)

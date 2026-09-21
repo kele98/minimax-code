@@ -217,8 +217,15 @@ export interface TurnRepository extends QueueClaimAcceptanceLookup, SessionMaint
     readonly leaseId: string;
     readonly queuePauseRevokeToken?: import('../../session-system/index.js').QueuePause;
   }): Promise<boolean>;
+  /**
+   * `expectedArchived` makes the claim conditional: the archived flag is
+   * re-read inside the claim transaction and a session that was restored
+   * while deletion was pending refuses with `session-not-archived` before
+   * any durable deletion state is written.
+   */
   beginSessionDeletion(
     sessionId: string,
+    opts?: { readonly expectedArchived?: boolean },
   ): Promise<Exclude<SessionDeletionState, { status: 'not-started' }>>;
   readSessionDeletion(sessionId: string): Promise<SessionDeletionState>;
   isSessionDeleting(sessionId: string): Promise<boolean>;

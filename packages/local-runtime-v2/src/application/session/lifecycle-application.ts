@@ -573,6 +573,7 @@ const LIFECYCLE_FAILURES: Readonly<
     key: "TASK_AGENT_CAPTURE_UNAVAILABLE",
   },
   "session-not-archived": { status: 409, key: "SESSION_NOT_ARCHIVED" },
+  "session-deletion-in-progress": { status: 409, key: "SESSION_DELETING" },
 };
 
 function lifecycleFailureMapping(reason: SessionServiceError["reason"]): {

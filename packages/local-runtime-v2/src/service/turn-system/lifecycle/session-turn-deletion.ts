@@ -33,7 +33,7 @@ export function createSessionTurnDeletionService(
   const lane = new KeyedOperationLane<string>();
 
   return {
-    run: (sessionId, cleanup) =>
+    run: (sessionId, cleanup, opts) =>
       lane.run(sessionId, async () => {
         const gate = await options.beginProcessDeletion(sessionId);
         if (gate.status === 'not-found') {
@@ -42,19 +42,24 @@ export function createSessionTurnDeletionService(
           return;
         }
         const operationDrain = options.operations.block(sessionId);
-        const dispatchDrain = options.dispatcher.quiesceSession(sessionId);
-        await options.repository.beginSessionDeletion(sessionId);
-        await Promise.all([operationDrain, dispatchDrain]);
-        await requireQuiescentTurn(options, sessionId);
-        await options.disposeRuntimeSession(sessionId);
-        await options.repository.deleteSessionData(sessionId);
         try {
+          const dispatchDrain = options.dispatcher.quiesceSession(sessionId);
+          // A refusal below rethrows without awaiting the dispatch drain, so
+          // keep that promise observed to avoid an unhandled rejection.
+          void dispatchDrain.catch(() => undefined);
+          await options.repository.beginSessionDeletion(sessionId, opts);
+          await Promise.all([operationDrain, dispatchDrain]);
+          await requireQuiescentTurn(options, sessionId);
+          await options.disposeRuntimeSession(sessionId);
+          await options.repository.deleteSessionData(sessionId);
           await cleanup();
         } catch (error) {
-          // The guarded terminal row delete refused the session (it was
-          // restored while deletion was pending). The durable deletion state
-          // must be released BEFORE rethrowing, or a restart-resume would pick
-          // the restored session up and delete it unconditionally.
+          // Both refusal points share this release: the conditional claim
+          // (the session was restored before any lock row was written) and
+          // the guarded terminal row delete. Without the release the
+          // in-memory process gate and the operations block would stay
+          // taken until restart, and a restart-resume would pick the
+          // restored session up and delete it unconditionally.
           if (error instanceof SessionServiceError && error.reason === 'session-not-archived') {
             await releaseSessionDeletionState(options, sessionId);
           }

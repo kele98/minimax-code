@@ -519,7 +519,7 @@ function createTurnFacade(input: {
     steer: (request) => input.steer.steer(request),
     dispatchSessionQueue: (sessionId) => input.dispatcher.continuePaused(sessionId),
     dispatchQueue: (sessionId) => input.dispatcher.dispatch(sessionId),
-    sessionDeletion: (sessionId, cleanup) => input.deletion.run(sessionId, cleanup),
+    sessionDeletion: (sessionId, cleanup, opts) => input.deletion.run(sessionId, cleanup, opts),
   };
 }
 

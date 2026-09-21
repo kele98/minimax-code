@@ -2618,6 +2618,43 @@ describe('TuiChatController', () => {
     });
   });
 
+  it('surfaces the dedicated next step when a deletion claim refuses the projection restore', async () => {
+    const runtime = {
+      getSession: vi.fn(async () => ({
+        sessionId: 'session-deleting',
+        workspaceDir: '/workspace',
+        archived: true,
+      })),
+      getMessages: vi.fn(async () => []),
+      archiveSession: vi.fn(async () => {
+        throw Object.assign(
+          new Error(
+            'This session is currently being deleted. Restoring is unavailable until deletion finishes.',
+          ),
+          { status: 409, key: 'SESSION_DELETING' },
+        );
+      }),
+      sendMessage: vi.fn(),
+      abortSession: vi.fn(async () => true),
+    };
+    const controller = new TuiChatController({
+      runtime,
+      transcript: new TranscriptStore(),
+      workspaceDir: '/workspace',
+    });
+
+    await expect(controller.loadSessionProjection('session-deleting')).rejects.toMatchObject({
+      key: 'SESSION_DELETING',
+    });
+
+    const snapshot = controller.snapshot();
+    expect(snapshot.status).toBe('error');
+    expect(snapshot.error).toContain(
+      'The session is being deleted in another window. It will disappear once deletion finishes.',
+    );
+    expect(snapshot.error).not.toContain('Retry');
+  });
+
   it('manages a selected Desktop session without requiring it to be active first', async () => {
     let archived = false;
     const runtime = {

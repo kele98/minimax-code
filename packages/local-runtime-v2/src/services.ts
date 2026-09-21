@@ -756,6 +756,11 @@ async function initializeRuntimeServiceOwners(
       (sessionId) =>
         cron ? hasActiveCronSessionOwner(cron.service, sessionId) : false,
     );
+    // Invariant: the persisted claim row is the durable adjudication, so the
+    // restart resume must not re-adjudicate it. A resume that re-checked
+    // expectedArchived would either refuse a decided deletion (dead weight —
+    // the restoring window already sees SESSION_DELETING and the claim would
+    // linger) or, worse, keep the row while refusing, livelocking the user.
     resumeSessionDeletion = (sessionId) =>
       sessionApplications.applications.session.lifecycle.deleteSessionById(
         sessionId,

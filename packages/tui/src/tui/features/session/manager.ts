@@ -964,7 +964,17 @@ export class TuiSessionManager implements Component, Focusable {
       return;
     }
     void this.runAction(async () => {
-      await this.options.onSetArchived(target.sessionId, false);
+      try {
+        await this.options.onSetArchived(target.sessionId, false);
+      } catch (error) {
+        if (isSessionBeingDeletedElsewhere(error)) {
+          // A deletion claim owns the session in another window; the row
+          // stays archived here and disappears once that deletion finishes.
+          this.setStatus('Session is being deleted in another window.', 'error');
+          return;
+        }
+        throw error;
+      }
       if (this.disposed) return;
       this.replaceSession({ ...target, archived: false });
       this.clampSelection();
@@ -1287,6 +1297,19 @@ function classifySessionDeleteRefusal(error: unknown): SessionDeleteRefusal {
   if (key === 'SESSION_NOT_ARCHIVED') return 'restored';
   if (key === 'CRON_OWNED_SESSION') return 'cron';
   return 'failed';
+}
+
+/**
+ * Detects a restore refusal caused by a concurrent deletion claim. The row
+ * stays archived in that window, so the user only needs to know it is being
+ * deleted elsewhere; other errors keep the generic runAction failure path.
+ */
+function isSessionBeingDeletedElsewhere(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { key?: unknown }).key === 'SESSION_DELETING'
+  );
 }
 
 function toTimestamp(value: number | string | undefined): number {

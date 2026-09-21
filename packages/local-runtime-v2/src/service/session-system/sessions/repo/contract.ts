@@ -353,7 +353,11 @@ export interface SessionRepository {
   ): Promise<TaskSessionBinding>;
   upsertImportedLegacy(record: SessionWriteRecord): Promise<void>;
   upsert(record: SessionWriteRecord): Promise<void>;
-  /** Expectations are checked atomically with the write; undefined skips title checks, null expects no title. */
+  /**
+   * Expectations are checked atomically with the write; undefined skips title checks, null expects no title.
+   * Unarchiving (any write that flips archived to false) refuses with
+   * session-deletion-in-progress while a deletion fence owns the session.
+   */
   update(
     sessionId: string,
     fields: SessionUpdateFields,

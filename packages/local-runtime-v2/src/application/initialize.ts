@@ -46,6 +46,7 @@ export interface InitializeApplicationsOptions {
     sessionDeletion(
       sessionId: string,
       cleanup: () => Promise<void>,
+      opts?: { readonly expectedArchived?: boolean },
     ): Promise<void>;
     submit: TurnService["submit"];
   };
@@ -115,8 +116,9 @@ export const initializeApplications: InitializeApplications = (options) => {
         // Authoritative pre-check, deliberately BEFORE the deletion fence: a
         // refusal here must run ahead of beginProcessDeletion so no durable
         // deletion state, turn abort, or history cleanup happens for a session
-        // that was restored while deletion was pending. The repo's guarded row
-        // delete covers the residual window after this read.
+        // that was restored while deletion was pending. The conditional claim
+        // below closes the residual window after this read: it re-adjudicates
+        // archived inside the claim transaction, atomically with the lock row.
         if (expectedArchived === true) {
           const record = await options.sessionSystem.repositories.sessions.get(sessionId);
           if (record && record.archived !== true) {
@@ -126,9 +128,13 @@ export const initializeApplications: InitializeApplications = (options) => {
             );
           }
         }
-        await options.turn.sessionDeletion(sessionId, async () => {
-          await deletion.deleteSession(sessionId, expectedArchived);
-        });
+        await options.turn.sessionDeletion(
+          sessionId,
+          async () => {
+            await deletion.deleteSession(sessionId, expectedArchived);
+          },
+          expectedArchived === true ? { expectedArchived: true } : undefined,
+        );
       },
     },
     ...(options.assertSessionDeletionAllowed

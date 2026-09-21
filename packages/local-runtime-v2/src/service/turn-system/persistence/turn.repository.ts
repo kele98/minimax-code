@@ -8,6 +8,8 @@ import {
   turnIngressClientRequests,
   turnIngressSequences,
 } from '../../../infra/db/schema/turn.js';
+import { sessions } from '../../../infra/db/schema/sessions.js';
+import { SessionServiceError } from '../../session-system/sessions/errors.js';
 import {
   COMPACTION_DELETING_OWNER_KIND,
   createRecoveredTerminalFact,
@@ -187,7 +189,7 @@ export function createTurnRepository(options: TurnRepositoryOptions): TurnReposi
         },
         legacyTurnLeaseObservations,
       ),
-    beginSessionDeletion: async (sessionId) => {
+    beginSessionDeletion: async (sessionId, opts) => {
       const pending = pendingSettlements.get(sessionId);
       const result = options.db.transaction(
         (tx) => {
@@ -199,6 +201,7 @@ export function createTurnRepository(options: TurnRepositoryOptions): TurnReposi
             makeDeletionOwnerId,
             isLeaseOwnerAlive,
             isLeaseOwnerCurrent,
+            expectedArchived: opts?.expectedArchived,
           });
         },
         { behavior: 'immediate' },
@@ -785,9 +788,28 @@ function beginSessionDeletionInTransaction(
     readonly makeDeletionOwnerId: () => string;
     readonly isLeaseOwnerAlive: (ownerId: string) => boolean | undefined;
     readonly isLeaseOwnerCurrent: (ownerId: string) => boolean;
+    readonly expectedArchived?: boolean;
   },
 ): Exclude<Awaited<ReturnType<TurnRepository['readSessionDeletion']>>, { status: 'not-started' }> {
   const { sessionId, now, makeDeletionOwnerId, isLeaseOwnerAlive, isLeaseOwnerCurrent } = input;
+  // The conditional claim adjudicates against the durable archived flag
+  // before any lock row is written or reclaimed: a session restored while
+  // deletion was pending must refuse with zero durable mutation, otherwise
+  // the restore could lose to a claim it raced against. A missing row stays
+  // claimable so the not-found lane keeps deciding later deletions.
+  if (input.expectedArchived === true) {
+    const sessionRow = tx
+      .select({ archived: sessions.archived })
+      .from(sessions)
+      .where(eq(sessions.sessionId, sessionId))
+      .get();
+    if (sessionRow && sessionRow.archived !== 1) {
+      throw new SessionServiceError(
+        'session-not-archived',
+        'This session is no longer archived. It was restored while deletion was pending.',
+      );
+    }
+  }
   recoverExpiredDeletionTurnInTransaction(tx, sessionId, now);
   const lock = findSessionLock(tx, sessionId);
   if (!lock) {

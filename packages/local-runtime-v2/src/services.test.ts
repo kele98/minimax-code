@@ -46,8 +46,10 @@ import { SessionServiceError } from "./service/session-system/sessions/errors.js
 import { SessionDeletionService } from "./service/session-system/sessions/lifecycle/deletion-service.js";
 import type { SessionRecord } from "./service/session-system/sessions/repo/contract.js";
 import { createSessionRepository } from "./service/session-system/sessions/repo/drizzle.js";
+import { createQueueTurnAdmissionPriorityFence } from "./service/session-system/queue/turn-priority-fence.js";
 import { createSessionOperationGate } from "./service/turn-system/lifecycle/session-operation-gate.js";
 import { createSessionTurnDeletionService } from "./service/turn-system/lifecycle/session-turn-deletion.js";
+import { createTurnRepository } from "./service/turn-system/persistence/turn.repository.js";
 
 type QueueClassifier = NonNullable<
   InitializeTurnSystemOptions["classifyQueuedItem"]
@@ -2897,6 +2899,13 @@ describe("runtime Session Application composition", () => {
     expect(
       mocked.runtimeApplications.session.lifecycle.deleteSessionById,
     ).toHaveBeenCalledWith("session-deleting");
+    // Pin the v4 invariant: the persisted claim row is the durable
+    // adjudication, so the resume path stays unconditional — exactly one
+    // argument, never an expectedArchived re-check that could re-adjudicate
+    // a decided deletion.
+    expect(
+      mocked.runtimeApplications.session.lifecycle.deleteSessionById.mock.calls.at(-1),
+    ).toEqual(["session-deleting"]);
     await services.close();
   });
 
@@ -4486,6 +4495,7 @@ describe("runtime conditional Session deletion", () => {
     expect(turnSessionDeletion).toHaveBeenCalledWith(
       record.sessionId,
       expect.any(Function),
+      { expectedArchived: true },
     );
     // The cleanups still run and the guard reaches the terminal row delete.
     expect(sequence).toContain("cleanup:legacy-migration");
@@ -4528,7 +4538,9 @@ describe("runtime conditional Session deletion", () => {
       }),
     ).resolves.toEqual({ success: true });
 
-    expect(turnSessionDeletion).toHaveBeenCalledWith("session-gone", expect.any(Function));
+    expect(turnSessionDeletion).toHaveBeenCalledWith("session-gone", expect.any(Function), {
+      expectedArchived: true,
+    });
     // The deletion service short-circuits on a missing record exactly as the
     // repo delete does: no cleanup, no terminal row delete, no error.
     expect(deleteSessionRecord).not.toHaveBeenCalled();
@@ -4699,5 +4711,413 @@ describe("runtime conditional Session deletion", () => {
     } finally {
       raw.close();
     }
+  });
+
+  function lockCount(raw: DatabaseLike): number {
+    const row = raw
+      .prepare("SELECT COUNT(*) AS count FROM local_runtime_session_locks")
+      .get() as { count: number };
+    return row.count;
+  }
+
+  it.each(["session-deletion", "turn-deleting"] as const)(
+    "refuses unarchiving while a %s claim owns the session and keeps the row archived",
+    async (ownerKind) => {
+      const raw = new Database(":memory:");
+      try {
+        const db = migratePluginTestDatabase(raw);
+        const repo = createSessionRepository({ db });
+        const created = await repo.create({
+          sessionId: "session-restore-refused",
+          agentName: "mavis",
+          workspaceDir: "/workspace",
+          runtime: "pi-agent",
+          archived: true,
+        });
+
+        // Another window holds a deletion claim over the archived session.
+        raw
+          .prepare(
+            "INSERT INTO local_runtime_session_locks (session_id, owner_id, owner_kind, acquired_at_ms, expires_at_ms) VALUES (?, ?, ?, ?, ?)",
+          )
+          .run(created.sessionId, "claiming-window", ownerKind, 1, 2_000_000_000_000);
+
+        await expect(repo.update(created.sessionId, { archived: false })).rejects.toMatchObject(
+          {
+            reason: "session-deletion-in-progress",
+            message:
+              "This session is currently being deleted. Restoring is unavailable until deletion finishes.",
+          },
+        );
+
+        // The refusal rolled the restore back: the row stays archived.
+        const refused = await repo.get(created.sessionId);
+        expect(refused?.archived).toBe(true);
+
+        // Without a claim the same unarchive succeeds, so restores keep
+        // winning once the deletion fence is gone.
+        raw
+          .prepare("DELETE FROM local_runtime_session_locks WHERE session_id = ?")
+          .run(created.sessionId);
+        const restored = await repo.update(created.sessionId, { archived: false });
+        expect(restored?.archived).toBe(false);
+      } finally {
+        raw.close();
+      }
+    },
+  );
+
+  it("refuses the conditional claim inside its transaction without touching the locks table", async () => {
+    const raw = new Database(":memory:");
+    try {
+      const db = migratePluginTestDatabase(raw);
+      const repo = createSessionRepository({ db });
+      const turns = createTurnRepository({
+        db,
+        priorityFence: createQueueTurnAdmissionPriorityFence(),
+        sessionAdmission: { rejectionInTransaction: () => undefined },
+        nowMs: () => 10,
+        makeLeaseId: () => "lease-claim",
+      });
+      const created = await repo.create({
+        sessionId: "session-claim",
+        agentName: "mavis",
+        workspaceDir: "/workspace",
+        runtime: "pi-agent",
+        archived: false,
+      });
+
+      // An active session cannot be conditionally claimed: the in-transaction
+      // archived check refuses and the claim row is never written.
+      await expect(
+        turns.beginSessionDeletion(created.sessionId, { expectedArchived: true }),
+      ).rejects.toMatchObject({
+        reason: "session-not-archived",
+        message:
+          "This session is no longer archived. It was restored while deletion was pending.",
+      });
+      expect(lockCount(raw)).toBe(0);
+
+      // Once archived, the same conditional claim succeeds and writes the row.
+      await repo.update(created.sessionId, { archived: true });
+      await expect(
+        turns.beginSessionDeletion(created.sessionId, { expectedArchived: true }),
+      ).resolves.toMatchObject({ status: "quiescent" });
+      const claim = raw
+        .prepare("SELECT owner_kind FROM local_runtime_session_locks WHERE session_id = ?")
+        .get(created.sessionId) as { owner_kind: string };
+      expect(claim.owner_kind).toBe("session-deletion");
+    } finally {
+      raw.close();
+    }
+  });
+
+  /**
+   * Full restore-race composition: a real session repository, a real turn
+   * repository, and the real deletion fence, wired through the production
+   * initializeApplications port. Only the in-process collaborators
+   * (controller, dispatcher, process gate) stay mocked so the tests can
+   * observe the fence boundary itself.
+   */
+  function createRestoreRaceComposition(input: {
+    readonly restoreBeforeClaim: boolean;
+  }) {
+    const raw = new Database(":memory:");
+    const db = migratePluginTestDatabase(raw);
+    const sessionsRepo = createSessionRepository({ db });
+    const realTurns = createTurnRepository({
+      db,
+      priorityFence: createQueueTurnAdmissionPriorityFence(),
+      sessionAdmission: { rejectionInTransaction: () => undefined },
+      nowMs: () => 10,
+      makeLeaseId: () => "lease-restore-race",
+      makeDeletionOwnerId: () => "session-delete:restore-race",
+    });
+    const sequence: string[] = [];
+    const cleanupPort = (name: string) =>
+      vi.fn(async () => {
+        sequence.push(`cleanup:${name}`);
+      });
+    const cleanupPorts = {
+      deleteCanvas: cleanupPort("canvas"),
+      deleteArtifacts: cleanupPort("artifacts"),
+      deleteDiff: cleanupPort("diff"),
+      deleteCommunication: cleanupPort("communication"),
+      deleteChannelBindings: cleanupPort("channel-bindings"),
+      deleteQuestionnaires: cleanupPort("questionnaires"),
+      deletePermissions: cleanupPort("permissions"),
+      deleteGoal: cleanupPort("goal"),
+      deleteQueryCollapse: cleanupPort("query-collapse"),
+      removePin: cleanupPort("pin"),
+      markLegacyMigrationDeleted: cleanupPort("legacy-migration"),
+    };
+    const reparentChildren = vi.fn(async () => {
+      sequence.push("sessions:reparent");
+    });
+    const clearSessionReference = vi.fn(async () => {
+      sequence.push("reference:clear");
+    });
+    const deleteSessionRecord = vi.fn(async (sessionId: string) => {
+      sequence.push("records:delete");
+      await sessionsRepo.delete(sessionId);
+    });
+    const deletion = new SessionDeletionService({
+      sessions: {
+        get: (sessionId: string) => sessionsRepo.get(sessionId),
+        reparentChildren,
+      },
+      clearSessionReference,
+      records: { deleteSessionRecord },
+      cleanup: cleanupPorts,
+      facts: { handle: vi.fn() },
+    });
+    const deleteSessionData = vi.fn(realTurns.deleteSessionData);
+    const racingTurns = {
+      ...realTurns,
+      deleteSessionData,
+      beginSessionDeletion: async (
+        sessionId: string,
+        opts?: { readonly expectedArchived?: boolean },
+      ) => {
+        if (input.restoreBeforeClaim) {
+          // The restoring window commits between the application pre-check
+          // and the claim transaction: restore-wins.
+          await sessionsRepo.update(sessionId, { archived: false });
+        }
+        return realTurns.beginSessionDeletion(sessionId, opts);
+      },
+    };
+    const completeProcessDeletion = vi.fn(() => {
+      sequence.push("process:complete");
+    });
+    const operations = createSessionOperationGate();
+    const disposeRuntimeSession = vi.fn(async () => {
+      sequence.push("runtime:dispose");
+    });
+    const fence = createSessionTurnDeletionService({
+      repository: racingTurns,
+      controller: {
+        abort: vi.fn(async () => ({ status: "aborted" as const, turnId: "turn-1" })),
+        activeTurnId: vi.fn(() => undefined),
+      },
+      dispatcher: { quiesceSession: vi.fn(async () => undefined) },
+      operations,
+      beginProcessDeletion: vi.fn(async () => {
+        sequence.push("process:begin");
+        return { status: "started" as const };
+      }),
+      completeProcessDeletion,
+      disposeRuntimeSession,
+      onSessionDeletionReleaseFailure: vi.fn(),
+    });
+    const applications = initializeApplications({
+      sessionSystem: {
+        repositories: { sessions: { get: (sessionId: string) => sessionsRepo.get(sessionId) } },
+        session: {
+          lifecycle: {
+            archiveSession: async (sessionId: string, archived: boolean) => {
+              await sessionsRepo.update(sessionId, { archived });
+            },
+          },
+          deletion: { create: () => deletion },
+          query: {},
+          maintenance: {},
+        },
+        messages: {},
+        files: {},
+        usage: {},
+        queryCollapse: {},
+        diff: {},
+        root: {},
+        queue: {},
+      },
+      compatibility: { diff: { capability: {} } },
+      attachmentRegistration: {},
+      resolveAgentWriteTarget: vi.fn(async (requestRef: string) => requestRef),
+      requireExactAgentKey: vi.fn(async (name: string) => name),
+      turn: {
+        sessionDeletion: (
+          sessionId: string,
+          cleanup: () => Promise<void>,
+          opts?: { readonly expectedArchived?: boolean },
+        ) => fence.run(sessionId, cleanup, opts),
+        submit: vi.fn(),
+      },
+      publishGlobalEvent: vi.fn(),
+      assertSessionDeletionAllowed: vi.fn(async () => undefined),
+      conversationMutationPort: {},
+    } as unknown as Parameters<typeof initializeApplications>[0]);
+    return {
+      raw,
+      applications,
+      sequence,
+      sessionsRepo,
+      operations,
+      completeProcessDeletion,
+      disposeRuntimeSession,
+      deleteSessionData,
+      deleteSessionRecord,
+      reparentChildren,
+      clearSessionReference,
+      cleanupPorts,
+    };
+  }
+
+  it("leaves everything untouched when the restore wins the race against the conditional claim", async () => {
+    const composition = createRestoreRaceComposition({ restoreBeforeClaim: true });
+    const { raw } = composition;
+    try {
+      const created = await composition.sessionsRepo.create({
+        sessionId: "session-restore-wins",
+        agentName: "mavis",
+        workspaceDir: "/workspace",
+        runtime: "pi-agent",
+        archived: true,
+      });
+
+      // The pre-check passes (archived), the restore commits inside the
+      // delegating claim, and the in-transaction archived check refuses.
+      await expect(
+        composition.applications.session.lifecycle.deleteSession({} as never, {
+          id: created.sessionId,
+          expectedArchived: true,
+        }),
+      ).rejects.toMatchObject({
+        status: 409,
+        key: "SESSION_NOT_ARCHIVED",
+        message: "This session is no longer archived. It was restored while deletion was pending.",
+      });
+
+      // Restore-wins: the row survives (unarchived) and no claim was written.
+      const surviving = await composition.sessionsRepo.get(created.sessionId);
+      expect(surviving?.archived).toBe(false);
+      expect(lockCount(raw)).toBe(0);
+
+      // Refused deletion touches NOTHING: no cleanup port, no reparent, no
+      // reference clear, no row delete, no turn data delete, no runtime
+      // disposal.
+      for (const port of Object.values(composition.cleanupPorts)) {
+        expect(port).not.toHaveBeenCalled();
+      }
+      expect(composition.reparentChildren).not.toHaveBeenCalled();
+      expect(composition.clearSessionReference).not.toHaveBeenCalled();
+      expect(composition.deleteSessionRecord).not.toHaveBeenCalled();
+      expect(composition.deleteSessionData).not.toHaveBeenCalled();
+      expect(composition.disposeRuntimeSession).not.toHaveBeenCalled();
+
+      // v4.6.1: the begin-refusal released the in-memory fence state, so the
+      // process gate and operations block do not leak until restart.
+      expect(composition.completeProcessDeletion).toHaveBeenCalledWith(created.sessionId);
+      expect(composition.operations.tryEnter(created.sessionId)).toBeDefined();
+      expect(composition.sequence).toEqual(["process:begin", "process:complete"]);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("refuses restoring a claimed session with SESSION_DELETING and lets the unconditional delete finish", async () => {
+    const composition = createRestoreRaceComposition({ restoreBeforeClaim: false });
+    const { raw } = composition;
+    try {
+      const created = await composition.sessionsRepo.create({
+        sessionId: "session-claim-first",
+        agentName: "mavis",
+        workspaceDir: "/workspace",
+        runtime: "pi-agent",
+        archived: true,
+      });
+
+      // Another window already claimed the deletion fence.
+      raw
+        .prepare(
+          "INSERT INTO local_runtime_session_locks (session_id, owner_id, owner_kind, acquired_at_ms, expires_at_ms) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(created.sessionId, "claiming-window", "session-deletion", 1, 2_000_000_000_000);
+
+      await expect(
+        composition.applications.session.lifecycle.archiveSession({} as never, {
+          id: created.sessionId,
+          archived: false,
+        }),
+      ).rejects.toMatchObject({
+        status: 409,
+        key: "SESSION_DELETING",
+        message:
+          "This session is currently being deleted. Restoring is unavailable until deletion finishes.",
+      });
+
+      // Claimed → the row stays archived and the claim stays intact.
+      const archivedRow = await composition.sessionsRepo.get(created.sessionId);
+      expect(archivedRow?.archived).toBe(true);
+
+      // The unconditional delete still completes, running each cleanup once
+      // and removing both the row and the claim.
+      await expect(
+        composition.applications.session.lifecycle.deleteSessionById(created.sessionId),
+      ).resolves.toBeUndefined();
+      for (const port of Object.values(composition.cleanupPorts)) {
+        expect(port).toHaveBeenCalledTimes(1);
+      }
+      expect(composition.reparentChildren).toHaveBeenCalledTimes(1);
+      expect(composition.clearSessionReference).toHaveBeenCalledTimes(1);
+      expect(composition.deleteSessionRecord).toHaveBeenCalledTimes(1);
+      expect(composition.deleteSessionData).toHaveBeenCalledTimes(1);
+      expect(composition.disposeRuntimeSession).toHaveBeenCalledTimes(1);
+      await expect(composition.sessionsRepo.get(created.sessionId)).resolves.toBeUndefined();
+      expect(lockCount(raw)).toBe(0);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("releases the in-memory fence state when the conditional claim refuses", async () => {
+    // Pins the v4.6.1 restructure: a begin-refusal (not just a cleanup
+    // refusal) must release the process gate and operations block.
+    const refusal = new SessionServiceError(
+      "session-not-archived",
+      "This session is no longer archived. It was restored while deletion was pending.",
+    );
+    const repository = {
+      beginSessionDeletion: vi.fn(async () => {
+        throw refusal;
+      }),
+      readSessionDeletion: vi.fn(async () => ({ status: "quiescent" as const })),
+      deleteSessionData: vi.fn(async () => undefined),
+      completeSessionDeletion: vi.fn(async () => undefined),
+    };
+    const completeProcessDeletion = vi.fn();
+    const operations = createSessionOperationGate();
+    const disposeRuntimeSession = vi.fn(async () => undefined);
+    const cleanup = vi.fn(async () => undefined);
+    const capability = createSessionTurnDeletionService({
+      repository,
+      controller: {
+        abort: vi.fn(async () => ({ status: "aborted" as const, turnId: "turn-1" })),
+        activeTurnId: vi.fn(() => undefined),
+      },
+      dispatcher: { quiesceSession: vi.fn(async () => undefined) },
+      operations,
+      beginProcessDeletion: vi.fn(async () => ({ status: "started" as const })),
+      completeProcessDeletion,
+      disposeRuntimeSession,
+      onSessionDeletionReleaseFailure: vi.fn(),
+    });
+
+    await expect(
+      capability.run("session-1", cleanup, { expectedArchived: true }),
+    ).rejects.toBe(refusal);
+
+    expect(repository.beginSessionDeletion).toHaveBeenCalledWith("session-1", {
+      expectedArchived: true,
+    });
+    // The release trio ran before the rethrow with the original error
+    // identity preserved, so nothing leaks until restart.
+    expect(repository.completeSessionDeletion).toHaveBeenCalledWith("session-1");
+    expect(completeProcessDeletion).toHaveBeenCalledWith("session-1");
+    expect(operations.tryEnter("session-1")).toBeDefined();
+    // Refused deletion stays non-destructive.
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(repository.deleteSessionData).not.toHaveBeenCalled();
+    expect(disposeRuntimeSession).not.toHaveBeenCalled();
   });
 });
